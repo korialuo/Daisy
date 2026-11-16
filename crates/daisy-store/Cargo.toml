@@ -1,0 +1,21 @@
+[package]
+name = "daisy-store"
+description = "Daisy 持久化层：SQLCipher 加密数据库、schema 迁移、主机与代理 CRUD"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daisy-core = { path = "../daisy-core" }
+rusqlite.workspace = true
+aes-gcm.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

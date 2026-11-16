@@ -1,0 +1,22 @@
+[package]
+name = "daisy-ssh"
+description = "Daisy SSH 会话层：密码 / RSA 私钥认证、PTY、跳板机"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daisy-core = { path = "../daisy-core" }
+daisy-net = { path = "../daisy-net" }
+daisy-term = { path = "../daisy-term" }
+tokio.workspace = true
+russh.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# 验收程序（examples/acceptance.rs）用它打开 debug 日志，
+# 排查真实主机的行为差异时非常有用
+tracing-subscriber.workspace = true

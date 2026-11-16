@@ -1,0 +1,10 @@
+# Daisy 统一格式化配置
+# 注意：edition 必须与 workspace.package.edition 保持一致
+edition = "2024"
+max_width = 100
+hard_tabs = true
+tab_spaces = 4
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_try_shorthand = true
+match_block_trailing_comma = true

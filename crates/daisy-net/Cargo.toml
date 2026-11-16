@@ -1,0 +1,14 @@
+[package]
+name = "daisy-net"
+description = "Daisy 网络层：连接抽象、SOCKS5 / HTTP CONNECT 隧道与本地端口转发"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daisy-core = { path = "../daisy-core" }
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true

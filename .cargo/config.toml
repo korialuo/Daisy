@@ -1,0 +1,16 @@
+# Windows 目标的静态 CRT。
+#
+# Rust 的 `x86_64-pc-windows-msvc` 默认是**动态** CRT（`/MD`，运行时依赖
+# vcruntime140.dll），而 `scripts/build-freerdp.ps1` 用
+# `CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`（`/MT`）编 FreeRDP。
+# 两者混用会在链接阶段报 LNK2038「RuntimeLibrary 不匹配」。
+#
+# 这里让 Rust 侧走静态 CRT，与 FreeRDP 对齐：
+#   * 产物不再依赖 VC++ 运行库，干净机器上双击就能跑；
+#   * cc / openssl-src 这类 C 依赖会读 CARGO_CFG_TARGET_FEATURE 里的
+#     crt-static，自动跟着用 /MT，不用逐个配。
+#
+# 只对 Windows 目标生效：macOS 构建完全不受影响，
+# `scripts/check-windows.sh` 的交叉检查也能照常跑（桩编译器不关心这个开关）。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

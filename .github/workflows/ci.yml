@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # macOS 是当前开发主平台，跑完整质量门
+  macos:
+    name: macOS · fmt + clippy + test + 交叉 check
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # 工具链完全由 rust-toolchain.toml 决定，避免两处版本打架
+      - name: 安装工具链（读取 rust-toolchain.toml）
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: clippy 零警告
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 单元测试
+        run: cargo test --workspace
+
+      # 交叉 check 的假 OpenSSL 安装目录要借宿主的 openssl@3 头文件；
+      # runner 上通常已有，这条负责兜住没有的镜像。
+      - name: 确保 openssl@3 存在（交叉 check 用头文件）
+        run: brew list openssl@3 >/dev/null 2>&1 || brew install openssl@3
+
+      - name: Windows 交叉 check（全工作区，桩编译器 + 假 OpenSSL）
+        run: scripts/check-windows.sh --clippy
+
+      - name: 界面烟雾测试
+        run: DAISY_SMOKE_MS=3000 cargo run -q -p daisy-app
+
+  # Windows 构建在 S11 适配阶段启用。
+  # 届时需要先构建 FreeRDP 静态库（CMake + vcpkg + Strawberry Perl + NASM），
+  # 再跑 daisy-rdp 的真实链接与打包。
+  # windows:
+  #   name: Windows · build + test
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: rustup show
+  #     - uses: Swatinem/rust-cache@v2
+  #     - run: cargo test --workspace

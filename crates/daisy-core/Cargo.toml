@@ -1,0 +1,26 @@
+[package]
+name = "daisy-core"
+description = "Daisy 核心：领域模型、配置、错误类型、跨模块事件总线"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+directories.workspace = true
+
+# DPAPI 保护主密钥（S11 步骤 86）。只在 Windows 目标编译。
+[target.'cfg(windows)'.dependencies]
+getrandom.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true

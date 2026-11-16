@@ -1,0 +1,65 @@
+# Rust
+/target
+/target*/
+**/*.rs.bk
+*.pdb
+
+# 本地数据库（含凭据，绝不入库）
+*.db
+*.db3
+*.db-shm
+*.db-wal
+*.sqlite
+
+# 密钥与凭据
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+.env
+.env.*
+
+# 例外：测试夹具（S6 步骤 42）
+# 这些是一次性生成的弃用密钥，不保护任何真实资源。
+# 详见 crates/daisy-ssh/tests/fixtures/README.md
+!crates/daisy-ssh/tests/fixtures/**
+
+# 日志
+*.log
+/logs/
+
+# 构建产物
+/vendor/
+/spike/**/build/
+/spike/**/target*/
+/build/out/
+# 打包产物（.app / .dmg）
+/dist/
+
+# 冒烟测试产物
+/spike/freerdp_c/link_check
+/spike/freerdp_c/rdp_capture
+/spike/freerdp_c/render
+# 截图可能含测试机桌面或本机信息，一律不入库
+/spike/**/*.png
+*.o
+*.dSYM/
+
+# 工具写入失败时残留的临时副本（如 cargo add / 编辑器原子写 / 编辑器备份）
+Cargo.toml??????
+Cargo.lock??????
+wrapper.h??????
+*~
+*~[0-9]*
+*.tmp
+*.tmp[0-9]*
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+STEPS_副本.md

@@ -1,0 +1,15 @@
+[package]
+name = "daisy-term"
+description = "Daisy 终端层：PTY 管理、VTE 解析、egui 渲染后端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daisy-core = { path = "../daisy-core" }
+egui.workspace = true
+portable-pty.workspace = true
+alacritty_terminal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

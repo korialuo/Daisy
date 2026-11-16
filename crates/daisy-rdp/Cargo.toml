@@ -1,0 +1,15 @@
+[package]
+name = "daisy-rdp"
+description = "Daisy RDP 层：FreeRDP 库模式封装、帧渲染、输入注入、剪贴板"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daisy-core = { path = "../daisy-core" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[build-dependencies]
+bindgen = "0.73"

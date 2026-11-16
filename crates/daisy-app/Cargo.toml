@@ -1,0 +1,44 @@
+[package]
+name = "daisy-app"
+description = "Daisy 桌面应用：egui 界面与会话管理"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+daisy-core = { path = "../daisy-core" }
+daisy-net = { path = "../daisy-net" }
+daisy-rdp = { path = "../daisy-rdp" }
+daisy-ssh = { path = "../daisy-ssh" }
+daisy-store = { path = "../daisy-store" }
+daisy-term = { path = "../daisy-term" }
+# 原生文件选择对话框（SFTP 上传）
+rfd = "0.15"
+# 文件列表的修改时间（本地时区）
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+eframe.workspace = true
+egui.workspace = true
+# 直接量中文字体的 ascent/descent 与字形轮廓，算出「墨迹相对行框偏多少」。
+# 版本与 epaint 内部用的对齐，避免同一进程里解析两套字体引擎。
+ab_glyph = "0.2"
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# 口令/密钥在内存里用后即擦（store.rs、main.rs 的主机口令）
+zeroize.workspace = true
+arboard = "3.6.1"
+
+# RDP 文件剪贴板（S10）：NSPasteboard 的文件 URL 读写。
+# 只用 msg_send/sel/class 这几个运行时原语，不引入庞大的生成绑定
+# （objc2-app-kit 的 feature 会拖进整套 AppKit 绑定）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# exe 资源（图标 + 版本信息）只在 Windows 宿主上真正编译，
+# 见 build.rs。放在宿主条件表里，macOS 构建根本不会拉这个依赖。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

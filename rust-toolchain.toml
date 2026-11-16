@@ -1,0 +1,13 @@
+# Rust 工具链固定配置
+# 本文件由 rustup 自动识别，进入本目录即使用指定版本，避免版本漂移。
+# 升级流程：改 channel → 本地跑一遍 cargo test → 提交前确认 CI 全绿。
+
+[toolchain]
+channel = "1.99.0"
+profile = "default"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = [
+    "aarch64-apple-darwin",   # macOS Apple Silicon（开发主目标）
+    "x86_64-apple-darwin",    # macOS Intel（发布兼容）
+    "x86_64-pc-windows-msvc", # Windows x64（开发期交叉 check + S11 适配阶段构建目标）
+]

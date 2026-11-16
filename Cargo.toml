@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/daisy-app",
+    "crates/daisy-core",
+    "crates/daisy-net",
+    "crates/daisy-rdp",
+    "crates/daisy-ssh",
+    "crates/daisy-store",
+    "crates/daisy-term",
+]
+# spike/ 是独立的预研工程，故意排除在 workspace 之外
+# vendor/ 是第三方 C 源码（FreeRDP），不是 Rust 工程
+exclude = ["spike", "vendor"]
+
+[workspace.package]
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+authors = ["korialuo <korialuo@gmail.com>"]
+
+[workspace.dependencies]
+# ==================== 当前已引用 ====================
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+directories = "6.0"
+eframe = "0.36"
+egui = "0.36"
+tokio = { version = "1.53", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+    "fs",
+] }
+
+# 存储与加密（S4）
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+aes-gcm = "0.11"
+hkdf = "0.13"
+sha2 = "0.11"
+zeroize = "1.9"
+getrandom = "0.4"
+tempfile = "3.27"
+
+# ==================== 后续阶段启用 ====================
+# 版本在此统一锁定，对应 crate 引用时直接 .workspace = true 即可。
+rand = "0.10"
+
+# Windows 专有 API（DPAPI、exe 资源）。只在 cfg(windows) 下引用，
+# 其它平台完全不编译，因此不影响 macOS 构建。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Memory",
+] }
+
+# S5 终端
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+
+# S6 SSH
+# 默认后端是 aws-lc-rs（需要 cmake + 完整 C 工具链）。这里换成 ring：
+# 体积更小，构建依赖更少，S11 的 Windows 构建会省事很多。
+#   * rsa   —— RSA 私钥认证必需（步骤 42）
+#   * flate2 —— 支持 zlib 压缩，老服务器常要求
+russh = { version = "0.64", default-features = false, features = [
+    "ring",
+    "rsa",
+    "flate2",
+] }
+
+# S7 代理
+tokio-socks = "0.5"
