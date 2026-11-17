@@ -61,7 +61,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security_Cryptography",
+    "Win32_System_DataExchange",
     "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
 ] }
 
 # S5 终端

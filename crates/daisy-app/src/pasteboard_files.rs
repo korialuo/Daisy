@@ -256,9 +256,201 @@ mod imp {
 #[cfg(target_os = "macos")]
 pub use imp::{read_files, write_files};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
 mod imp {
-	/// 非 macOS：S11（Windows 构建）再实现；先给空实现占位。
+	use std::os::windows::ffi::{OsStrExt, OsStringExt};
+	use std::path::PathBuf;
+
+	use windows_sys::Win32::Foundation::{BOOL, GlobalFree, HANDLE, HGLOBAL};
+	use windows_sys::Win32::System::DataExchange::{
+		CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+		IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+	};
+	use windows_sys::Win32::System::Memory::{
+		GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+	};
+	use windows_sys::Win32::System::Ole::CF_HDROP;
+	use windows_sys::Win32::UI::Shell::{DROPFILES, DragQueryFileW};
+
+	/// 剪贴板的 `changeCount`：Windows 用系统级单调序号，语义与 macOS 的
+	/// `changeCount` 完全一样（每次剪贴板变化就变），可直接复用上层判重逻辑。
+	/// `OpenClipboard` 不一定非要成功才能读序号——序号是全局的。
+	fn sequence() -> i64 {
+		// SAFETY: 无参数、无副作用，返回 u32 序号。
+		unsafe { GetClipboardSequenceNumber() as i64 }
+	}
+
+	/// 资源管理器里「复制文件」落的是 `CF_HDROP`；`DragQueryFileW` 是唯一
+	/// 能把它展开成路径列表的 API（传 `0xFFFFFFFF` 先问条数）。
+	///
+	/// # Safety
+	/// 调用线程最好是主线程（剪贴板 API 本身不要求，但 COM 化的格式要求 STA）。
+	pub unsafe fn read_files() -> Option<super::ClipboardFiles> {
+		// SAFETY: 空 HWND 表示当前线程 owned；主线程调用。
+		if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+			tracing::debug!("[剪贴板] OpenClipboard 失败（读），跳过");
+			return None;
+		}
+		// 任何提前 return 都必须关掉剪贴板，否则别的程序全粘不了。
+		let result = (|| {
+			if unsafe { IsClipboardFormatAvailable(CF_HDROP as u32) } == 0 {
+				return None;
+			}
+			// SAFETY: 格式可用，句柄在剪贴板关闭前有效。
+			let handle: HANDLE = unsafe { GetClipboardData(CF_HDROP as u32) };
+			if handle.is_null() {
+				return None;
+			}
+			// SAFETY: HDROP 就是 GetClipboardData(CF_HDROP as u32) 的返回句柄。
+			let count = unsafe { DragQueryFileW(handle, 0xFFFF_FFFF, std::ptr::null_mut(), 0) };
+			if count == 0 || count == 0xFFFF_FFFF {
+				return None;
+			}
+
+			let mut paths = Vec::with_capacity(count as usize);
+			let mut skipped = 0usize;
+			for index in 0..count {
+				// SAFETY: 先传空缓冲问长度（含结尾 NUL）。
+				let needed = unsafe { DragQueryFileW(handle, index, std::ptr::null_mut(), 0) };
+				if needed == 0 || needed == 0xFFFF_FFFF {
+					skipped += 1;
+					continue;
+				}
+				let mut wide = vec![0u16; needed as usize + 1];
+				// SAFETY: 缓冲区按 needed 分配，DragQueryFileW 写入不超过它。
+				let written =
+					unsafe { DragQueryFileW(handle, index, wide.as_mut_ptr(), wide.len() as u32) };
+				if written == 0 {
+					skipped += 1;
+					continue;
+				}
+				wide.truncate(wide.iter().position(|c| *c == 0).unwrap_or(wide.len()));
+				let path = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+				// 与 macOS 一致：文件夹整棵带不过去（FileContents 按单文件取字节）。
+				if path.is_dir() || path.as_os_str().is_empty() {
+					skipped += 1;
+					continue;
+				}
+				paths.push(path);
+			}
+			Some(super::ClipboardFiles {
+				change_count: sequence(),
+				paths,
+				skipped,
+			})
+		})();
+		// SAFETY: 前面 OpenClipboard 成功，这里必须配对关闭。
+		unsafe { CloseClipboard() };
+		result
+	}
+
+	/// 构造 `CF_HDROP` 的字节布局：20 字节 packed 头 + UTF-16LE 路径表（双 NUL）。
+	/// 抽成纯函数是为了单测能核对——错一个字节资源管理器就读不到文件。
+	pub(super) fn build_dropfiles(paths: &[PathBuf]) -> Vec<u8> {
+		// DROPFILES 是 packed(1)，必须按字节写，不能用结构体指针赋值
+		// （Rust 默认对齐后续字段，偏移会和 Win32 约定不符）。
+		let header_size = std::mem::size_of::<DROPFILES>();
+		let mut bytes: Vec<u8> = Vec::new();
+		bytes.extend_from_slice(&(header_size as u32).to_le_bytes()); // pFiles
+		bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.x
+		bytes.extend_from_slice(&0i32.to_le_bytes()); // pt.y
+		bytes.extend_from_slice(&0i32.to_le_bytes()); // fNC
+		bytes.extend_from_slice(&1i32.to_le_bytes()); // fWide = TRUE
+		debug_assert_eq!(
+			bytes.len(),
+			header_size,
+			"DROPFILES 头必须是 packed 20 字节"
+		);
+
+		for path in paths {
+			for unit in path.as_os_str().encode_wide() {
+				bytes.extend_from_slice(&unit.to_le_bytes());
+			}
+			bytes.extend_from_slice(&0u16.to_le_bytes()); // 每个路径的 NUL
+		}
+		bytes.extend_from_slice(&0u16.to_le_bytes()); // 整个表的额外 NUL
+		bytes
+	}
+
+	/// 把远端下载好的文件挂到系统剪贴板：`CF_HDROP` + UTF-16LE 双 NUL 路径表。
+	/// 资源管理器里按 Ctrl+V 就能粘到用户选的目录。
+	///
+	/// # Safety
+	/// 主线程调用；`SetClipboardData` 成功后内存所有权交给系统，不能再 `GlobalFree`。
+	pub unsafe fn write_files(paths: &[PathBuf]) -> Option<i64> {
+		if paths.is_empty() {
+			return None;
+		}
+
+		let bytes = build_dropfiles(paths);
+
+		// SAFETY: GMEM_MOVEABLE 是 SetClipboardData 的硬性要求。
+		let global: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) };
+		if global.is_null() {
+			tracing::warn!("[剪贴板] GlobalAlloc 失败（{} 字节）", bytes.len());
+			return None;
+		}
+		// SAFETY: 刚分配的句柄，锁一次取可写指针。
+		let ptr = unsafe { GlobalLock(global) } as *mut u8;
+		if ptr.is_null() {
+			// SAFETY: 独占句柄，锁失败说明它仍可释放。
+			unsafe { GlobalFree(global) };
+			return None;
+		}
+		// SAFETY: 分配了 bytes.len()，逐字节写进去。
+		unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+		// SAFETY: 与上面的 GlobalLock 配对。
+		unsafe { GlobalUnlock(global) };
+
+		// SAFETY: 主线程；失败时要自己释放句柄（成功则系统接管）。
+		if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+			unsafe { GlobalFree(global) };
+			tracing::warn!("[剪贴板] OpenClipboard 失败（写）");
+			return None;
+		}
+		let result = (|| {
+			// SAFETY: 打开剪贴板后才能清空。
+			if unsafe { EmptyClipboard() } == 0 {
+				return None;
+			}
+			// SAFETY: global 里是完整的 CF_HDROP 数据；成功后所有权转给系统。
+			let set: HANDLE = unsafe { SetClipboardData(CF_HDROP as u32, global) };
+			if set.is_null() {
+				return None;
+			}
+			Some(sequence())
+		})();
+		// SAFETY: 与 OpenClipboard 配对。
+		unsafe { CloseClipboard() };
+
+		if result.is_none() {
+			// SetClipboardData 失败时系统没接管，要自己释放。
+			unsafe { GlobalFree(global) };
+		} else {
+			tracing::info!(
+				"[剪贴板] 已把 {} 个文件挂上系统剪贴板（CF_HDROP），资源管理器里可直接粘贴",
+				paths.len()
+			);
+		}
+		result
+	}
+
+	// 只用到导入但类型检查需要确认的常量；编译期断言 packed 布局符合 Win32。
+	const _: () = {
+		assert!(
+			std::mem::size_of::<DROPFILES>() == 20,
+			"DROPFILES 必须是 20 字节"
+		);
+		let _: BOOL = 0;
+	};
+}
+
+#[cfg(target_os = "windows")]
+pub use imp::{read_files, write_files};
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod imp {
+	/// 其它平台：暂无实现，给空实现占位。
 	pub fn read_files() -> Option<super::ClipboardFiles> {
 		None
 	}
@@ -268,19 +460,19 @@ mod imp {
 	}
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub use imp::{read_files, write_files};
 
 /// 读剪贴板上的文件列表（封装掉平台差异与 unsafe 标注）。
 pub fn clipboard_files() -> Option<ClipboardFiles> {
-	// macOS 实现里有 ObjC 调用；非 macOS 占位是安全函数，
-	// `unsafe` 会报 unused_unsafe，所以只在 macOS 包。
-	#[cfg(target_os = "macos")]
+	// 原生实现里有平台 API 调用；其它平台的占位是安全函数，
+	// `unsafe` 会报 unused_unsafe，所以只在有实现的平台包。
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	{
 		// SAFETY: 主线程调用（界面代码调用方保证）。
 		unsafe { read_files() }
 	}
-	#[cfg(not(target_os = "macos"))]
+	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 	{
 		read_files()
 	}
@@ -288,12 +480,12 @@ pub fn clipboard_files() -> Option<ClipboardFiles> {
 
 /// 把本地文件挂上剪贴板，返回写入时的 `changeCount`。
 pub fn put_files(paths: &[std::path::PathBuf]) -> Option<i64> {
-	#[cfg(target_os = "macos")]
+	#[cfg(any(target_os = "macos", target_os = "windows"))]
 	{
 		// SAFETY: 主线程调用（界面代码调用方保证）。
 		unsafe { write_files(paths) }
 	}
-	#[cfg(not(target_os = "macos"))]
+	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 	{
 		write_files(paths)
 	}
@@ -302,6 +494,44 @@ pub fn put_files(paths: &[std::path::PathBuf]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Windows 的 `CF_HDROP` 字节布局：头 20 字节、pFiles=20、fWide=1、
+	/// 每个路径 UTF-16LE 后跟 NUL、整个表再跟一个 NUL。
+	/// 这一步纯布局检查，不碰系统剪贴板，CI 里也能跑。
+	#[cfg(target_os = "windows")]
+	#[test]
+	fn dropfiles_layout() {
+		use imp::build_dropfiles;
+		let paths = vec![
+			std::path::PathBuf::from(r"C:\dev\a.txt"),
+			std::path::PathBuf::from(r"C:\dev\b.md"),
+		];
+		let bytes = build_dropfiles(&paths);
+
+		assert_eq!(
+			u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+			20,
+			"pFiles 应为 20"
+		);
+		assert_eq!(
+			u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+			1,
+			"fWide 应为 1"
+		);
+		// 头部之后的 UTF-16LE 内容：把路径段拼回来核对。
+		let wide: Vec<u16> = bytes[20..]
+			.chunks_exact(2)
+			.map(|c| u16::from_le_bytes([c[0], c[1]]))
+			.collect();
+		let text = String::from_utf16(&wide).unwrap();
+		assert!(text.contains(r"C:\dev\a.txt"), "路径表缺 a.txt：{text:?}");
+		assert!(text.contains(r"C:\dev\b.md"), "路径表缺 b.md：{text:?}");
+		assert_eq!(
+			wide.iter().filter(|c| **c == 0).count(),
+			3,
+			"两条路径 + 表尾共 3 个 NUL"
+		);
+	}
 
 	/// 写入 → 读回的往返。要求剪贴板可用（CI 无头环境跳过）。
 	///
