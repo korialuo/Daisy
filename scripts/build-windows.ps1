@@ -13,22 +13,26 @@
 
   产物：dist\Daisy-windows-x64\daisy.exe 以及同名 zip。
 
-.PARAMETER Debug
+.PARAMETER DebugBuild
   构建 debug 版（默认 release）。
 
+  名字不能叫 `Debug`：那是 PowerShell 的公共参数，`[CmdletBinding()]` 下
+  重复声明会直接报「A parameter with the name 'Debug' was defined multiple times」。
+
 .EXAMPLE
-  pwsh -File scripts/build-windows.ps1
+  pwsh -File scripts/build-windows.ps1                 # release
+  pwsh -File scripts/build-windows.ps1 -DebugBuild     # debug
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$Debug
+    [switch]$DebugBuild
 )
 
 $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$Profile = if ($Debug) { 'debug' } else { 'release' }
+$Profile = if ($DebugBuild) { 'debug' } else { 'release' }
 $Stage = Join-Path $Root "dist\Daisy-windows-x64"
 $Zip = Join-Path $Root "dist\Daisy-windows-x64.zip"
 
@@ -60,14 +64,23 @@ if (-not $env:LIBCLANG_PATH) {
 }
 
 $cargoArgs = @('build', '-p', 'daisy-app')
-if (-not $Debug) { $cargoArgs += '--release' }
+if (-not $DebugBuild) { $cargoArgs += '--release' }
 
 Write-Step "cargo $($cargoArgs -join ' ')"
 & cargo @cargoArgs
 if ($LASTEXITCODE -ne 0) { Write-Error "构建失败" }
 
 Write-Step "整理产物到 $Stage"
-if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+if (Test-Path $Stage) {
+    # 上一次跑完的 daisy.exe 还开着时，Windows 会锁住这个目录，
+    # Remove-Item 抛的是一句「Cannot access the file ... in use」，
+    # 看不出该干什么。这里把话说明白。
+    try {
+        Remove-Item -Recurse -Force $Stage -ErrorAction Stop
+    } catch {
+        Write-Error "清不掉 $Stage —— 里面的 daisy.exe 多半还在运行。先关掉 Daisy 再重跑本脚本。"
+    }
+}
 New-Item -ItemType Directory -Path $Stage -Force | Out-Null
 
 $exe = Join-Path $Root "target\$Profile\daisy-app.exe"
@@ -86,7 +99,10 @@ Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Zip
 
 Write-Step "完成"
 Write-Host "  可执行：$Stage\daisy.exe"
-Write-Host "  压缩包：$Zip（{0:N1} MB）" -f ((Get-Item $Zip).Length / 1MB)
+# Write-Host 没有 -f 参数：`"...{0}" -f x` 必须先算成一个字符串再交给它，
+# 否则 PowerShell 把 `-f` 和后面的括号当成两个多余的位置参数，脚本以退出码 1 收场
+# （包其实已经打好了，只有最后一行报 ParameterBindingException）。
+Write-Host ("  压缩包：{0}（{1:N1} MB）" -f $Zip, ((Get-Item $Zip).Length / 1MB))
 Write-Host ""
 Write-Host "  自检建议：" -ForegroundColor Yellow
 Write-Host "    1. 双击 daisy.exe 不应出现黑色控制台窗口"

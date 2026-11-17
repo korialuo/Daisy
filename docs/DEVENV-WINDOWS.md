@@ -165,8 +165,28 @@ pwsh -File scripts\build-freerdp.ps1 -Clean
 
 # C. 出 exe
 cargo build -p daisy-app
-# D. 打包
+# D. 打包（构建 + 整理 dist\Daisy-windows-x64\ + 打 zip）
 pwsh -File scripts\build-windows.ps1
+```
+
+### 3.1 实测结果（2026-11-17，korialuo-dev）
+
+```
+release 构建   17 分 54 秒（首次；debug 约 1 分 12 秒增量）
+产物           target\release\daisy-app.exe   33.9 MB
+打包           dist\Daisy-windows-x64\daisy.exe + README.md + LICENSE
+               dist\Daisy-windows-x64.zip      13.7 MB
+```
+
+启动验证：窗口标题 `Daisy 0.2.3`，中文界面正常，**没有黑框控制台**，左侧主机/代理与本地
+PowerShell 终端（ConPTY）都可用。只剩 `LNK4099`（openssl 的 `ossl_static.pdb` 缺失）警告，无害。
+
+**同步源码到这台机器**：`sendclip` 只能发文本，二进制传不过去。走公开仓库 + 代理：
+
+```powershell
+curl -L -s -f -o C:\dev\src.tar.gz `
+  https://ghfast.top/https://github.com/korialuo/Daisy/archive/<commit>.tar.gz
+tar -xzf C:\dev\src.tar.gz --strip-components=1 -C C:\dev\daisy
 ```
 
 ---
