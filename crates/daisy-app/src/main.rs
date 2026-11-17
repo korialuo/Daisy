@@ -1625,6 +1625,11 @@ impl eframe::App for DaisyApp {
 			self.sessions.poll(ui.ctx(), store);
 		}
 
+		// 弹出去的 RDP 桌面每帧都要画，**与当前看的是哪个标签页无关**：
+		// `ui_active` 只跑激活的那一个，切走之后 egui 会把没画到的视口
+		// 判为「本帧未使用」直接关掉——那正是「独立窗口自己消失了」
+		self.sessions.detached_viewports(ui.ctx());
+
 		let tokens = design::tokens(ui.ctx());
 
 		// ---- 状态栏 ----

@@ -63,6 +63,12 @@ vcpkg 提供 OpenSSL 与 zlib 的静态库，是这套构建的硬依赖：
 "@
 }
 
+# 先把用户配的 vcpkg 位置钉死：vcvars64.bat 会把它**改成 VS 自带的那个**
+# （`VCPKG_ROOT=<VS>\VC\vcpkg`），而 VS 自带的是「只有清单模式」的实例，
+# 接着调 vcpkg 就报「does not have a classic mode instance」——看起来像 vcpkg
+# 装坏了，其实是路径被换掉了。
+$VcpkgRoot = $env:VCPKG_ROOT
+
 foreach ($tool in @('cmake', 'ninja')) {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         Write-Error "缺少 $tool。安装：winget install Kitware.CMake / winget install Ninja-build.Ninja"
@@ -76,6 +82,12 @@ foreach ($tool in @('cmake', 'ninja')) {
 #   2) vcpkg 按 v143（VS2022）找工具集；机器上只有 VS2019 时，编 OpenSSL
 #      会报「could not find v143」，而这句话不会告诉你该改什么。
 # 所以这里先找 vcvars64.bat 把环境导进来，再按 cl.exe 的实际版本钉工具集。
+# 返回 vcvars64.bat 路径 + 该 VS 的**主版本号**（16=2019 / 17=2022 / 18=2026）。
+# 主版本号是唯一能可靠区分工具集的依据：
+#   * 用 cl.exe 的 19.x 小版本号判不出来——VS2022 17.10 之后也发 19.4x，
+#     而它的工具集仍然叫 v143；VS2026 才是 v144。
+#   * `-requires VC.Tools.x86.x64` 会把没装 C++ 工作负载的实例过滤掉，
+#     否则会选中一个连 VC 目录都没有的 VS（本机装 VS2026 时就踩过）。
 function Find-VcVars {
     $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
     if (-not (Test-Path $vswhere)) { return $null }
@@ -84,37 +96,52 @@ function Find-VcVars {
         -property installationPath
     if (-not $install) { return $null }
     $vcvars = Join-Path $install 'VC\Auxiliary\Build\vcvars64.bat'
-    if (Test-Path $vcvars) { return $vcvars }
-    return $null
+    if (-not (Test-Path $vcvars)) { return $null }
+    $ver = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationVersion
+    $major = if ($ver -match '^(\d+)\.') { [int]$Matches[1] } else { 17 }
+    return [pscustomobject]@{ VcVars = $vcvars; Major = $major; Install = $install }
 }
 
 # 用 where.exe 而不是 Get-Command：导入 vcvars 之后 PATH 变了，
 # PowerShell 的命令发现在某些版本上会拿旧结果，where 每次真去翻文件系统。
+#
+# 必须走 `cmd /c ... 2>nul`：PowerShell 5.1 里原生程序的 stderr 会被包成
+# ErrorRecord，本脚本开了 $ErrorActionPreference='Stop'，找不到 cl.exe 时
+# `& where.exe cl.exe 2>$null` 会**直接终结整个脚本**——表现为「什么都没干就退出」。
 function Get-ClPath {
-    $p = & where.exe cl.exe 2>$null | Select-Object -First 1
+    $p = (& cmd /c 'where cl.exe 2>nul' | Select-Object -First 1)
     if ($p -and (Test-Path $p)) { return $p }
     return $null
 }
 
 if (-not (Get-ClPath)) {
-    $vcvars = Find-VcVars
-    if (-not $vcvars) {
+    $found = Find-VcVars
+    if (-not $found) {
         Write-Error @"
 找不到 MSVC 编译器（cl.exe），也没找到带 C++ 生成工具的 Visual Studio。
 
-装 VS2019 或 VS2022 Build Tools，勾「使用 C++ 的桌面开发」（含 MSVC + Windows SDK）：
-  winget install Microsoft.VisualStudio.2022.BuildTools
+装 VS2022 Build Tools，勾「使用 C++ 的桌面开发」（含 MSVC + Windows SDK）：
+  https://aka.ms/vs/17/release/vs_BuildTools.exe
+
+静默安装（管理员 PowerShell）：
+  .\vs_BuildTools.exe --quiet --wait --norestart --nocache --installPath C:\BT2022 ``
+      --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended
 
 装完重开终端再跑本脚本；也可以手动开「x64 Native Tools Command Prompt」执行。
 "@
     }
-    Write-Step "导入 MSVC 环境：$vcvars"
+    $vcvars = $found.VcVars
+    Write-Step "导入 MSVC 环境：$vcvars（VS 主版本 $($found.Major)）"
     $lines = & cmd /c "`"$vcvars`" >nul 2>&1 && set"
     foreach ($line in @($lines)) {
         if ($line -match '^([^=]+)=(.*)$') {
             Set-Item -Path ("env:" + $Matches[1]) -Value $Matches[2] -ErrorAction SilentlyContinue
         }
     }
+    # vcvars64.bat 覆盖了 VCPKG_ROOT（见上面 $VcpkgRoot 的注释），这里改回来
+    $env:VCPKG_ROOT = $VcpkgRoot
     if (-not (Get-ClPath)) {
         Write-Error "导入 vcvars64.bat 后仍找不到 cl.exe。请手动在「x64 Native Tools Command Prompt」里运行本脚本。"
     }
@@ -123,16 +150,33 @@ if (-not (Get-ClPath)) {
 if (-not $env:VCPKG_PLATFORM_TOOLSET) {
     $clPath = Get-ClPath
     $clOut = & $clPath 2>&1 | Out-String
-    $minor = if ($clOut -match 'Version\s+19\.(\d+)') { [int]$Matches[1] } else { 30 }
-    if ($minor -lt 20) {
-        Write-Error "检测到 VS2017 或更早的工具集（cl 19.$minor）。FreeRDP 3.x 与 Rust 的 msvc 目标都要求 VS2019 及以上。"
+    if ($clOut -match 'Version\s+19\.(\d+)' -and [int]$Matches[1] -lt 20) {
+        Write-Error "检测到 VS2017 或更早的工具集（cl 19.$($Matches[1])）。FreeRDP 3.x 与 Rust 的 msvc 目标都要求 VS2019 及以上。"
     }
-    $env:VCPKG_PLATFORM_TOOLSET = if ($minor -ge 30) { 'v143' } else { 'v142' }
-    Write-Step "VCPKG_PLATFORM_TOOLSET=$($env:VCPKG_PLATFORM_TOOLSET)（按 cl.exe 19.$minor 判定；要覆盖就自己设这个环境变量）"
+    # 工具集名跟着 VS 主版本走，不跟 cl 的小版本走（见 Find-VcVars 的注释）。
+    # cl.exe 本来就在 PATH 上的情况（从「Native Tools」提示符里跑）也要问一次 vswhere。
+    if (-not $found) { $found = Find-VcVars }
+    $major = if ($found) { $found.Major } else { 17 }
+    $env:VCPKG_PLATFORM_TOOLSET = switch ($major) {
+        16 { 'v142' }
+        17 { 'v143' }
+        18 { 'v144' }
+        default { 'v143' }
+    }
+    Write-Step "VCPKG_PLATFORM_TOOLSET=$($env:VCPKG_PLATFORM_TOOLSET)（VS 主版本 $major；要覆盖就自己设这个环境变量）"
 }
 
 Write-Step "安装 vcpkg 依赖（openssl、zlib 的静态版）"
-& "$env:VCPKG_ROOT\vcpkg.exe" install openssl:x64-windows-static zlib:x64-windows-static
+# 两个坑：
+#   * `--classic`——2025 年之后的 vcpkg-tool 在「没有 vcpkg.json 的目录」里默认按
+#     清单模式处理，直接报「Could not locate a manifest (vcpkg.json) above the
+#     current working directory / This vcpkg distribution does not have a classic
+#     mode instance」。我们从仓库根调用，本来就没有清单，必须显式要经典模式。
+#   * 走 `cmd /c`——本脚本 `$ErrorActionPreference = 'Stop'`，而 PowerShell 5.1
+#     会把原生程序写到 stderr 的每一行包成 ErrorRecord；vcpkg 的进度/警告都走
+#     stderr，直接把脚本打断在半路（现象就是「明明手工跑得通，脚本却报错退出」）。
+$vcpkgCmd = "`"$VcpkgRoot\vcpkg.exe`" install --classic openssl:x64-windows-static zlib:x64-windows-static"
+& cmd /c $vcpkgCmd
 if ($LASTEXITCODE -ne 0) { Write-Error "vcpkg install 失败" }
 
 if ($Clean -and (Test-Path $Build)) {
@@ -145,16 +189,21 @@ Write-Step "配置：构建=$Build"
 Write-Step "配置：安装=$Prefix"
 
 # 与 macOS 版的选项逐条对应，改一边时记得改另一边。
+#
+# 带变量的参数一律用 `-f` 拼成**一个**字符串再放进数组：`'前缀' + (Join-Path ...)`
+# 这种写法在 PowerShell 5.1 里可能被拆成两个 argv（cmake 会报
+# 「Ignoring extra path from command line」而且工具链根本没生效）。
+$toolchainFile = Join-Path $VcpkgRoot 'scripts\buildsystems\vcpkg.cmake'
 $cmakeArgs = @(
     '-S', $Src,
     '-B', $Build,
     '-G', 'Ninja',
     '-DCMAKE_BUILD_TYPE=Release',
-    '-DCMAKE_INSTALL_PREFIX=' + $Prefix,
+    ('-DCMAKE_INSTALL_PREFIX={0}' -f $Prefix),
     # 静态 CRT：Rust 侧由仓库根的 .cargo/config.toml 用 +crt-static 钉成 /MT
     # （msvc 目标默认是 /MD），FreeRDP 必须跟着走，否则 LNK2038 运行时不匹配。
     '-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded',
-    '-DCMAKE_TOOLCHAIN_FILE=' + (Join-Path $env:VCPKG_ROOT 'scripts\buildsystems\vcpkg.cmake'),
+    ('-DCMAKE_TOOLCHAIN_FILE={0}' -f $toolchainFile),
     '-DVCPKG_TARGET_TRIPLET=x64-windows-static',
     '-DBUILD_SHARED_LIBS=OFF',
     '-DFREERDP_UNIFIED_BUILD=ON',

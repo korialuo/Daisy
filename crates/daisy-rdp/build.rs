@@ -108,14 +108,23 @@ fn main() {
 
 	let out_dir = PathBuf::from(env::var("OUT_DIR").expect("缺少 OUT_DIR"));
 	let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+	// 宿主三元组（如 `x86_64-pc-windows-msvc`）。判「是不是真机构建」必须用它：
+	// 只看目标 OS 会把「Windows 上编 Windows」也当成交叉 check——那正是
+	// 2026-11-17 在真机上踩到的坑：整片 FFI 类型缺失，222 个编译错误。
+	let host = env::var("HOST").unwrap_or_default();
 
 	println!("cargo:rerun-if-changed=wrapper.h");
 	println!("cargo:rerun-if-changed=build.rs");
 
-	// 交叉 check：目标平台非 macOS 时跳过 bindgen 与链接。
+	let native = match target_os.as_str() {
+		"windows" => host.contains("windows"),
+		"macos" => host.contains("apple-darwin"),
+		_ => false,
+	};
+
+	// 交叉 check：目标与宿主不同平台时跳过 bindgen 与链接。
 	// bindgen 需按目标平台解析系统头，macOS 上没有 Windows SDK。
-	// 本 crate 的真实 Windows 兼容性归 S11 在 Windows 机器上验证。
-	if target_os != "macos" {
+	if !native {
 		// 但**不能只写个空占位**——那样 daisy-rdp 与依赖它的 daisy-app
 		// 整片都编译不过，交叉 check 就永远看不到应用层的平台错误。
 		// 这里复用宿主上一次真实生成（也就是 macOS 那份）的绑定做类型检查。
@@ -153,6 +162,84 @@ fn main() {
 	}
 }
 
+/// Windows 上 libclang 需要的标准头目录。
+///
+/// 优先用 `INCLUDE`（VS 开发者环境已经设好）；没有就自己找：
+/// vswhere → `VC/Tools/MSVC/<最新>/include`，以及 Windows Kits 的
+/// `Include/<最新>/{ucrt,shared,um,winrt}`。
+fn windows_include_dirs() -> Vec<PathBuf> {
+	if let Ok(include) = env::var("INCLUDE") {
+		let dirs: Vec<PathBuf> = include
+			.split(';')
+			.filter(|part| !part.is_empty())
+			.map(PathBuf::from)
+			.filter(|path| path.is_dir())
+			.collect();
+		if !dirs.is_empty() {
+			return dirs;
+		}
+	}
+
+	let mut dirs = Vec::new();
+	if let Some(vs) = vswhere_install_path() {
+		if let Some(msvc) = newest_dir(&vs.join("VC/Tools/MSVC")) {
+			dirs.push(msvc.join("include"));
+		}
+	}
+	if let Ok(pf86) = env::var("ProgramFiles(x86)") {
+		if let Some(kits) = newest_dir(&PathBuf::from(pf86).join("Windows Kits/10/Include")) {
+			for sub in ["ucrt", "shared", "um", "winrt"] {
+				let dir = kits.join(sub);
+				if dir.is_dir() {
+					dirs.push(dir);
+				}
+			}
+		}
+	}
+	if dirs.is_empty() {
+		println!(
+			"cargo:warning=没能定位 MSVC / Windows SDK 的头文件目录，\
+			 bindgen 可能找不到 stdlib.h；在「x64 Native Tools」提示符里构建最稳"
+		);
+	}
+	dirs
+}
+
+/// 用 vswhere 找带 C++ 工具集的 VS 安装根（与 build-freerdp.ps1 同一判据）。
+fn vswhere_install_path() -> Option<PathBuf> {
+	let pf86 = env::var("ProgramFiles(x86)").ok()?;
+	let vswhere = PathBuf::from(pf86).join("Microsoft Visual Studio/Installer/vswhere.exe");
+	if !vswhere.is_file() {
+		return None;
+	}
+	let out = Command::new(vswhere)
+		.args([
+			"-latest",
+			"-products",
+			"*",
+			"-requires",
+			"Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+			"-property",
+			"installationPath",
+		])
+		.output()
+		.ok()?;
+	let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+	(!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// 目录下名字最大的子目录（`14.44.35207`、`10.0.28000.0` 这类版本目录）。
+fn newest_dir(parent: &Path) -> Option<PathBuf> {
+	let mut found: Vec<PathBuf> = fs::read_dir(parent)
+		.ok()?
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| path.is_dir())
+		.collect();
+	found.sort();
+	found.pop()
+}
+
 /// 用 bindgen 生成 FreeRDP 绑定。
 ///
 /// 两个平台共用同一张 allowlist——它描述的是「Daisy 要用哪些 API」，
@@ -161,11 +248,22 @@ fn generate_bindings(manifest: &Path, prefix: &Path, out_dir: &Path) {
 	let inc_freerdp = prefix.join("include/freerdp3");
 	let inc_winpr = prefix.join("include/winpr3");
 
-	let bindings = bindgen::Builder::default()
+	let mut builder = bindgen::Builder::default()
 		.header(manifest.join("wrapper.h").display().to_string())
 		.clang_arg(format!("-I{}", inc_freerdp.display()))
 		.clang_arg(format!("-I{}", inc_winpr.display()))
-		.clang_arg("-I/usr/include")
+		.clang_arg("-I/usr/include");
+
+	// Windows：libclang **不会**自己去翻 MSVC 与 UCRT 的头文件，连 `stdlib.h`
+	// 都会 `file not found`。在「x64 Native Tools」提示符里跑时 INCLUDE 已经齐备，
+	// 直接用；普通命令行里就自己去 vswhere 与 Windows Kits 找一遍。
+	if cfg!(windows) {
+		for dir in windows_include_dirs() {
+			builder = builder.clang_arg(format!("-I{}", dir.display()));
+		}
+	}
+
+	let bindings = builder
 		// 顶层实例与上下文
 		.allowlist_type("freerdp")
 		.allowlist_type("rdpContext")
@@ -339,9 +437,41 @@ fn configure_windows(manifest: &Path, root: &Path, out_dir: &Path) {
 	generate_bindings(manifest, &prefix, out_dir);
 
 	println!("cargo:rustc-link-search=native={}", libdir.display());
-	println!("cargo:rustc-link-lib=static=freerdp3");
-	println!("cargo:rustc-link-lib=static=winpr3");
-	println!("cargo:rustc-link-lib=static=freerdp-client3");
+	// `-bundle`：**不要**把静态库塞进 rlib，让 rustc 在最终链接时把
+	// `freerdp3.lib` 原样交给 link.exe。
+	//
+	// 踩过的坑（2026-11-17 真机）：默认的 `+bundle` 会把这几个库当「行李」
+	// 打包进 rlib，而 FreeRDP 的 Windows 构建开着 IPO（归档里全是 /GL 模块，
+	// 92 MB）。打进 rlib 后再取出，link.exe 就**完全看不到这些符号**——
+	// 表现为 29 个 LNK2019（`freerdp_new`、`cliprdr_VirtualChannelEntryEx`…），
+	// 而 `-L` 搜索路径却正常传到了链接行（只有 `-l` 消失），很容易误判成
+	// 「库没找到」。同一个 .lib 用最小 C 程序链接是好的，所以问题只在打包这一步。
+	for lib in ["freerdp3", "winpr3", "freerdp-client3"] {
+		println!("cargo:rustc-link-lib=static:-bundle={lib}");
+	}
+
+	// `remdesk-common`：静态 addin 表（`CLIENT_STATIC_ADDIN_TABLE`）会把 remdesk
+	// 通道的入口一起拖进链接，而它的辅助函数（`remdesk_write_ctl_header` 等）
+	// 在**另一个**静态库里，FreeRDP 只把它单独安装、不并进 `freerdp-client3`。
+	// 不显式链上就是 3 个 LNK2001。
+	//
+	// 安装位置两个平台不一样，文件名也跟着平台变（Windows `remdesk-common.lib`
+	// / macOS `libremdesk-common.a`）：macOS 在 `lib/freerdp3/`（macOS 分支的
+	// 搜索路径里本来就有这一条，所以那边一直没暴露），Windows 直接躺在 prefix
+	// 根目录。这里把两种可能都试一遍，谁在就用谁。
+	for dir in [
+		prefix.clone(),
+		prefix.join("lib"),
+		prefix.join("lib/freerdp3"),
+	] {
+		let found =
+			dir.join("remdesk-common.lib").exists() || dir.join("libremdesk-common.a").exists();
+		if found {
+			println!("cargo:rustc-link-search=native={}", dir.display());
+			println!("cargo:rustc-link-lib=static:-bundle=remdesk-common");
+			break;
+		}
+	}
 
 	// FreeRDP 静态库自身的外部依赖：OpenSSL 与 zlib。
 	// Windows 上这两样由 vcpkg 提供静态版（scripts/build-freerdp.ps1 会装）。
@@ -356,9 +486,26 @@ fn configure_windows(manifest: &Path, root: &Path, out_dir: &Path) {
 			 若链接报 ssl / crypto / zlib 相关符号缺失，先设这个环境变量"
 		),
 	}
-	println!("cargo:rustc-link-lib=static=libssl");
-	println!("cargo:rustc-link-lib=static=libcrypto");
-	println!("cargo:rustc-link-lib=static=zlib");
+	// 同样 `-bundle`：理由见上面 freerdp3 那段。这三份也在 vcpkg 的静态目录里，
+	// 打包进 rlib 一样会丢符号。
+	println!("cargo:rustc-link-lib=static:-bundle=libssl");
+	println!("cargo:rustc-link-lib=static:-bundle=libcrypto");
+	// 注意库名：vcpkg 的 zlib 1.4 起把静态库改名成 `libzs.lib`（旧的 vcpkg
+	// 与自编 zlib 是 `zlib.lib`），照旧写死 `zlib` 会在真机上得到
+	// `LNK1104: cannot open file 'zlib.lib'`。按目录里实际存在的挑一个。
+	let zlib_name = ["zlib", "libzs", "zs"]
+		.iter()
+		.find(|name| {
+			env::var("VCPKG_ROOT").is_ok_and(|root| {
+				PathBuf::from(root)
+					.join("installed/x64-windows-static/lib")
+					.join(format!("{name}.lib"))
+					.exists()
+			})
+		})
+		.copied()
+		.unwrap_or("zlib");
+	println!("cargo:rustc-link-lib=static:-bundle={zlib_name}");
 
 	// Win32 系统库。按用途分组，缺哪个补哪个：
 	//   网络：ws2_32 dnsapi iphlpapi

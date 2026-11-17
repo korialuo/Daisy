@@ -1135,7 +1135,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-app"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-core"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "directories",
  "getrandom 0.4.3",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-net"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "daisy-core",
  "thiserror 2.0.21",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-rdp"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "bindgen",
  "daisy-core",
@@ -1199,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-ssh"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "daisy-core",
  "daisy-net",
@@ -1214,7 +1214,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-store"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "aes-gcm",
  "daisy-core",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "daisy-term"
-version = "0.2.1"
+version = "0.2.3"
 dependencies = [
  "alacritty_terminal",
  "daisy-core",

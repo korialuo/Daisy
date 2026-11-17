@@ -130,9 +130,33 @@ if [ "${APP_ONLY}" -eq 1 ]; then
 	exit 0
 fi
 
+# ---- dmg ------------------------------------------------------------------
+#
+# 卷根只放两样东西：Daisy.app 与一个指向 /Applications 的快捷方式，
+# 用户把图标拖过去就是「装到本机」，不用自己去开 Finder 的另一扇窗。
+#
+# 窗口尺寸与图标位置写在预生成的 `.DS_Store` 里。为什么不现场摆：常规做法是
+# 挂载可写 dmg 再用 AppleScript 指挥 Finder，那需要「自动化 → Finder」权限，
+# 无 GUI 环境下直接 -10004 失败，而且失败是静默的（包照样出，只是布局没生效）。
+# 预生成模板与卷、机器都无关，随镜像写进去即可，全程不碰 GUI。
+# 模板的生成与改动见 scripts/dmg-layout.py。
+STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/daisy-dmg.XXXXXX")"
+trap 'rm -rf "${STAGE_DIR}"' EXIT
+
+echo "==> 暂存 dmg 内容"
+# ditto 而不是 cp -R：保住扩展属性与签名附加信息
+ditto "${APP_DIR}" "${STAGE_DIR}/${APP_NAME}.app"
+ln -s /Applications "${STAGE_DIR}/Applications"
+if [ -f assets/dmg/ds_store.template ]; then
+	cp assets/dmg/ds_store.template "${STAGE_DIR}/.DS_Store"
+else
+	echo "    警告：缺 assets/dmg/ds_store.template，dmg 会按 Finder 默认大小打开" >&2
+	echo "    生成：python3 -m pip install --user ds_store && python3 scripts/dmg-layout.py" >&2
+fi
+
 echo "==> 生成 dmg"
 rm -f "${DMG_PATH}"
-hdiutil create -volname "${APP_NAME}" -srcfolder "${APP_DIR}" -ov -format UDZO "${DMG_PATH}" >/dev/null
+hdiutil create -volname "${APP_NAME}" -srcfolder "${STAGE_DIR}" -fs HFS+ -ov -format UDZO "${DMG_PATH}" >/dev/null
 
 echo
 echo "完成："

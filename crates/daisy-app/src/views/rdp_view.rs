@@ -6,6 +6,7 @@
 //! 属于步骤 64b。但**鼠标坐标反变换**这一步已经做了——没有它，点击位置
 //! 会随窗口大小整体偏移，输入根本没法用。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use daisy_core::model::{MAX_SCALE_FACTOR, MIN_SCALE_FACTOR, ScaleMode, ScaleSettings};
@@ -16,6 +17,19 @@ use daisy_rdp::{
 
 use crate::design;
 use crate::rdp_session::{RdpSession, RdpStatus};
+
+/// 每个 [`RdpView`] 的唯一序号，用来生成视口 id。
+///
+/// **不能用标题或主机拼**：同一台主机可以开两个标签页，id 撞了会让两个
+/// 独立窗口互相顶掉（egui 里同 id 的 viewport 只有一份）。
+static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
+
+/// 无人值守验证：出图后自动把画面独立到单独窗口。
+///
+/// 独立窗口是新建的系统窗口，脚本化点击被系统权限拦（见 `MEMORY.md` 的
+/// 无人值守一节），没有这个钩子就只能靠人点按钮才截得到那一幕。
+/// 取值随意，存在即生效。
+const SMOKE_DETACH_ENV: &str = "DAISY_SMOKE_RDP_DETACH";
 
 /// 画面刷新时请求重绘的间隔。
 ///
@@ -644,6 +658,22 @@ pub struct RdpView {
 	///
 	/// 每帧在 [`Self::poll`] 开头刷新：`flush_resolution` 手里没有 `ctx`。
 	pixels_per_point: f32,
+	/// 画面是否独立到了单独窗口。
+	///
+	/// 独立窗口只是**换一个视口画同一份纹理**：会话、输入、缩放全都不搬家，
+	/// 所以收回标签页时不会重连，远端也不会感知到任何变化。
+	detached: bool,
+	/// 独立窗口的视口 id（每个视图唯一，见 [`NEXT_VIEW_ID`]）。
+	detached_id: egui::ViewportId,
+	/// 独立窗口是否全屏。
+	detached_fullscreen: bool,
+	/// 上一次下发的全屏状态。
+	///
+	/// 用它做「状态变了才发」的判据：每帧都发 `Fullscreen` 会让窗口管理器
+	/// 每帧判断一次进出全屏，macOS 上表现为动画反复重放。
+	detached_fullscreen_sent: Option<bool>,
+	/// 无人值守钩子是否已经触发过独立窗口。
+	smoke_detached: bool,
 }
 
 /// 解析 `"x,y"`，任一不是 0..=65535 的整数就返回 `None`。
@@ -997,6 +1027,14 @@ impl RdpView {
 			dpi,
 			reported_dpi: dpi,
 			avail: egui::Vec2::ZERO,
+			detached: false,
+			detached_id: egui::ViewportId::from_hash_of((
+				"rdp-detached",
+				NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed),
+			)),
+			detached_fullscreen: false,
+			detached_fullscreen_sent: None,
+			smoke_detached: false,
 		}
 	}
 
@@ -1061,13 +1099,21 @@ impl RdpView {
 		} else {
 			self.scale_toolbar(ui);
 			self.resolution_toolbar(ui);
+			self.smoke_detach();
 			// 「跟随窗口」每帧按最新可用区域重算；防抖把拖动期间的
-			// 连续变化吸收成一次请求
+			// 连续变化吸收成一次请求。独立窗口下 `avail` 由那个窗口刷新，
+			// 差一帧对 300ms 的防抖窗口没有影响
 			if self.resolution.follow {
 				self.queue_follow_resize();
 			}
 			self.flush_resolution();
-			self.paint_frame(ui, true);
+			if self.detached {
+				// 画面画到独立窗口，标签页里只留提示与收回入口
+				self.show_detached(ui.ctx());
+				self.detached_hint(ui);
+			} else {
+				self.paint_frame(ui, true);
+			}
 			// 帧在别的线程到达，不续帧就看不到更新
 			ui.ctx().request_repaint_after(REPAINT_INTERVAL);
 		}
@@ -1080,6 +1126,119 @@ impl RdpView {
 		}
 
 		self.pending.take()
+	}
+
+	/// 每帧渲染独立窗口（由 [`crate::session_mgr::SessionManager::detached_viewports`]
+	/// 对所有标签页统一调用）。
+	///
+	/// **为什么必须脱离标签页绘制**：`ui_active` 只跑激活的那一个标签页，
+	/// 而 egui 的 immediate viewport 是「本帧没画到就关掉」。用户切到别的
+	/// 标签页时，弹出去的桌面会自己消失——看起来就像窗口被莫名其妙关掉了。
+	///
+	/// `poll` 也在这里补一次：非激活标签页没人调 `ui()`，不轮询就收不到
+	/// 新帧，独立窗口会定格在切走前那一张。
+	pub fn detached_pass(&mut self, ctx: &egui::Context) {
+		if !self.detached {
+			return;
+		}
+		self.poll(ctx);
+		self.show_detached(ctx);
+	}
+
+	/// 把画面画到独立的系统窗口里。
+	///
+	/// 用 **immediate** viewport 而不是 deferred：纹理、输入、焦点都在同一个
+	/// `Context` 里，不需要把帧再往另一个上下文搬一份；代价是这个窗口的绘制
+	/// 在父窗口的那一帧里同步跑完——RDP 画面本来就是每 16ms 一次，无感。
+	///
+	/// **按钮栏不跟着搬**：独立窗口里只留纯桌面。缩放/分辨率/全屏仍在标签页
+	/// 的工具栏上，另加 F11 快捷键，所以窗口里一像素界面元素都不会压住远端。
+	fn show_detached(&mut self, ctx: &egui::Context) {
+		let builder = egui::ViewportBuilder::default()
+			.with_title(format!("{} — Daisy", self.title))
+			.with_app_id("daisy-rdp")
+			// 首开给个像样的尺寸：太小的窗口一进来就是「铺满」裁边，容易
+			// 让人以为画面坏了
+			.with_inner_size([1280.0, 800.0])
+			.with_min_inner_size([480.0, 320.0]);
+		let id = self.detached_id;
+		let mut closed = false;
+
+		ctx.show_viewport_immediate(id, builder, |ui, _class| {
+			// 点窗口的 × 是「收回标签页」，不是关掉会话——会话死掉会直接
+			// 断链，而用户只是不想让它占一个窗口
+			if ui.ctx().input(|input| input.viewport().close_requested()) {
+				closed = true;
+			}
+			// F11 切全屏。**不转发给远端**：这是本机窗口的事，
+			// 远端收到 F11 只会平白无故进一次全屏
+			if ui.input(|input| input.key_pressed(egui::Key::F11)) {
+				self.detached_fullscreen = !self.detached_fullscreen;
+			}
+			if self.detached_fullscreen_sent != Some(self.detached_fullscreen) {
+				ui.ctx()
+					.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.detached_fullscreen));
+				self.detached_fullscreen_sent = Some(self.detached_fullscreen);
+			}
+
+			// 底色先铺满：适应窗口档在宽高比不一致时会留黑边，
+			// 不铺的话露出来的是窗口默认底色（浅色主题下很扎眼）
+			let bg = design::tokens(ui.ctx()).bg_deep;
+			ui.painter().rect_filled(ui.max_rect(), 0.0, bg);
+
+			self.paint_frame(ui, true);
+
+			// 本机光标的最后一句话要在**这个**视口里说：`set_cursor_icon`
+			// 是按视口生效的，交回主窗口收尾会把主窗口的箭头一起藏掉
+			if self.hide_local_cursor {
+				ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+			}
+			ui.ctx().request_repaint_after(REPAINT_INTERVAL);
+		});
+
+		if closed {
+			self.detach_back();
+		}
+		self.hide_local_cursor = false;
+	}
+
+	/// 收起独立窗口，回到标签页里显示。
+	fn detach_back(&mut self) {
+		self.detached = false;
+		self.detached_fullscreen = false;
+		// 下次再独立时重新下发一次全屏状态（窗口是新的，旧记录不作数）
+		self.detached_fullscreen_sent = None;
+	}
+
+	/// 独立窗口打开时，标签页里显示的占位内容。
+	fn detached_hint(&mut self, ui: &mut egui::Ui) {
+		ui.vertical_centered(|ui| {
+			ui.add_space(60.0);
+			ui.label("画面已在独立窗口显示");
+			ui.add_space(design::GAP_SM);
+			if design::chip(ui, "收回标签页", false).clicked() {
+				self.detach_back();
+			}
+			ui.add_space(design::GAP_SM);
+			ui.weak("独立窗口里按 F11 切换全屏；关掉那个窗口等于收回，会话不会断");
+		});
+	}
+
+	/// 无人值守钩子：出图后自动独立窗口（见 [`SMOKE_DETACH_ENV`]）。
+	fn smoke_detach(&mut self) {
+		if self.smoke_detached || self.detached {
+			return;
+		}
+		if std::env::var(SMOKE_DETACH_ENV).is_err() {
+			return;
+		}
+		// 等首帧到了再切：不然独立窗口先闪一下「等待首帧画面」
+		if self.texture.is_none() {
+			return;
+		}
+		self.smoke_detached = true;
+		self.detached = true;
+		tracing::info!("无人值守钩子：画面已独立到单独窗口");
 	}
 
 	/// 断开告知框。返回 `true` 表示用户确认了。
@@ -1253,6 +1412,23 @@ impl RdpView {
 					// 拖动过程每一帧都是 changed；只在松手时落库，
 					// 否则加密库写入会被每秒几十次
 					changed = response.drag_stopped();
+				}
+			}
+
+			// 独立窗口 / 全屏：与「画面怎么显示」同类，放在这一行末尾
+			ui.add_space(design::GAP_MD);
+			let detach_label = if self.detached { "收回标签页" } else { "独立窗口" };
+			if design::chip(ui, detach_label, self.detached).clicked() {
+				if self.detached {
+					self.detach_back();
+				} else {
+					self.detached = true;
+				}
+			}
+			if self.detached {
+				let fullscreen_label = if self.detached_fullscreen { "退出全屏" } else { "全屏" };
+				if design::chip(ui, fullscreen_label, self.detached_fullscreen).clicked() {
+					self.detached_fullscreen = !self.detached_fullscreen;
 				}
 			}
 		});
@@ -1598,17 +1774,25 @@ impl RdpView {
 
 		// ---- 远端文件的剪贴板（S10）----
 		//
-		// 下载完成的文件落盘到「下载」目录并挂上本地剪贴板：
-		// Finder 里 Cmd+V 就能粘出来，和 mstsc 的体感一致。
-		// 失败（超限/远端拒绝）也要说出来，不说话就变成「复制了没反应」。
+		// 字节先落到**系统缓存**里再挂剪贴板：RDP 的文件通道只能按字节取，
+		// 没有「先给个链接、要用再拉」的机制，所以数据总得落盘一次。
+		// 但落点是缓存而不是「下载」——远端按一次 Ctrl+C 就往用户目录里
+		// 堆文件，是用户明确反馈过的问题（2026-11-17）。
+		// Finder 里 Cmd+V 仍然是把这份文件复制到他选定的目录。
 		if let Some(error) = self.session.take_download_error() {
 			self.notify(format!("远端文件剪贴板失败：{error}"), true);
 		}
 		if let Some(files) = self.session.take_remote_files() {
+			// 每批一个子目录：跨批不会互相顶出 ` (1)`，文件名保持远端原名。
+			// 旧批次直接清掉——剪贴板同一时刻只有一批能粘。
+			let root = staging_root();
+			clear_staging(&root);
+			let dir = root.join(batch_dir_name());
+
 			let mut saved = Vec::new();
 			let mut failed = 0;
 			for file in &files {
-				match save_for_clipboard(&file.name, &file.data) {
+				match save_for_clipboard(&dir, &file.name, &file.data) {
 					Ok(path) => saved.push(path),
 					Err(error) => {
 						failed += 1;
@@ -1634,18 +1818,18 @@ impl RdpView {
 					});
 				let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
 				// 落盘成功但挂不上剪贴板时必须说清楚：用户会去 Finder 里
-				// 按 Cmd+V，只听到一声 beep，完全不知道文件其实在「下载」里。
+				// 按 Cmd+V，只听到一声 beep，完全不知道文件其实在缓存里。
 				let message = if clipped {
 					format!(
-						"已从远端复制 {} 个文件（{}），可在 Finder 里直接粘贴",
+						"已就绪 {} 个文件（{}），在 Finder 里按 Cmd+V 粘到目标目录",
 						saved.len(),
 						names.join("、")
 					)
 				} else {
 					format!(
-						"{} 个文件已存到「下载」（{}），但没能挂上系统剪贴板，请在 Finder 里手动取用",
+						"{} 个文件已存到 {}，但没能挂上系统剪贴板，请手动取用",
 						saved.len(),
-						names.join("、")
+						dir.display()
 					)
 				};
 				self.notify(message, !clipped);
@@ -2552,6 +2736,11 @@ impl RdpView {
 					if !should_forward_key(ui.ctx(), key, physical_key) {
 						continue;
 					}
+					// 独立窗口里 F11 是「切全屏」的快捷键，被本机消费掉，
+					// **不能再发给远端**——否则远端也会跟着进一次全屏
+					if self.detached && physical_key.unwrap_or(key) == egui::Key::F11 {
+						continue;
+					}
 					// **Ctrl+C / Ctrl+X 也算「复制意图」**：Windows 习惯的用户
 					// 按的是 Ctrl 而不是 Cmd，这条路径不走 `Event::Copy`，
 					// 于是「远端没广播」的诊断永远不会触发——用户只看到
@@ -2848,56 +3037,60 @@ fn should_arm(has_transferable_files: bool, announced_now: bool) -> bool {
 	!has_transferable_files && !announced_now
 }
 
-/// 为「挂剪贴板」落盘：**文件名必须和远端一模一样**。
+/// 远端文件在本机的中转目录。
 ///
-/// 不能沿用 [`save_into`] 的「重名加序号」：那会返回
-/// `b (3).txt`，用户粘出来就是 `b (3).txt`，再粘一次变 `b (4).txt`——
-/// 真机反馈的「粘贴后文件名带（1）（2）」就是这么来的（序号是我们加的，
-/// 不是 Finder 加的）。
+/// **不是「下载」目录**（2026-11-17 用户反馈）：远端按一次 Ctrl+C，
+/// 文件就无声无息堆进「下载」，用户既没要求也不想要。
+/// RDP 的文件通道只能按字节取，没有「先给个链接、要用再拉」的机制，
+/// 所以字节总得落盘一次——那就落在系统缓存里，用户目录一个文件都不多。
 ///
-/// 三种情况：
-/// 1. 下载目录没有同名文件 → 存「下载」（用户能在 Finder 里看到）
-/// 2. 有同名且内容一致 → 复用（反复复制同一批文件不产生副本）
-/// 3. 有同名但内容不同 → 存进缓存目录（**同名**），既不覆盖也不改名
-fn save_for_clipboard(name: &str, data: &[u8]) -> std::io::Result<std::path::PathBuf> {
+/// 用户在 Finder 里 Cmd+V 仍然是把这份文件**复制**到他选定的目录，
+/// 文件名保持远端原名。
+fn staging_root() -> std::path::PathBuf {
 	let home = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-	let downloads = home.join("Downloads");
-	let cache = home
-		.join("Library")
+	home.join("Library")
 		.join("Caches")
 		.join("Daisy")
-		.join("clipboard");
-	save_for_clipboard_in(&downloads, &cache, name, data)
+		.join("clipboard")
 }
 
-/// [`save_for_clipboard`] 的实际实现（目录可注入，便于单测）。
-fn save_for_clipboard_in(
-	downloads: &std::path::Path,
-	cache: &std::path::Path,
+/// 清掉中转目录里的旧批次。
+///
+/// 剪贴板同一时刻只挂得下一批文件，旧的那批已经没人能粘了；
+/// 留着只会在缓存里越攒越多。顺带保证「上一轮崩在写入中途」留下的
+/// 半截目录不会混进这一批。
+fn clear_staging(root: &std::path::Path) {
+	let Ok(entries) = std::fs::read_dir(root) else {
+		return;
+	};
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if path.is_dir() {
+			let _ = std::fs::remove_dir_all(&path);
+		}
+	}
+}
+
+/// 这一批的子目录名：时间戳，跨进程也不重样。
+fn batch_dir_name() -> String {
+	std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_millis().to_string())
+		.unwrap_or_else(|_| "0".to_string())
+}
+
+/// 为「挂剪贴板」落盘：文件名必须和远端一模一样。
+///
+/// 每批一个独立子目录，所以**跨批永远不会重名**，不需要 ` (1)` 这类后缀；
+/// 同一批里真撞名（远端两个不同目录下的同名文件）才加序号，
+/// 那属于没法两全的情况。
+fn save_for_clipboard(
+	dir: &std::path::Path,
 	name: &str,
 	data: &[u8],
 ) -> std::io::Result<std::path::PathBuf> {
-	let safe_name = name
-		.rsplit(['\\', '/'])
-		.next()
-		.filter(|s| !s.is_empty() && *s != "." && *s != "..")
-		.unwrap_or("未命名");
-
-	let preferred = downloads.join(safe_name);
-	let same_content = preferred.exists()
-		&& std::fs::read(&preferred)
-			.map(|existing| existing == data)
-			.unwrap_or(false);
-	if !preferred.exists() || same_content {
-		// 情况 1 / 2：直接落在「下载」，名字保持原样
-		return save_into(downloads, safe_name, data);
-	}
-
-	// 情况 3：下载目录里已有同名但内容不同的文件。存进缓存目录（同名），
-	// 粘出来的名字才是对的；缓存目录里的同名冲突极罕见（上次也可能存过），
-	// 真有就让 `save_into` 加序号——那份用户看不见，不影响粘贴体验。
-	std::fs::create_dir_all(cache)?;
-	save_into(cache, safe_name, data)
+	std::fs::create_dir_all(dir)?;
+	save_into(dir, name, data)
 }
 
 /// 往目录里写一个文件，**重名加序号**（`a.txt` → `a (1).txt`）。
@@ -2905,9 +3098,8 @@ fn save_for_clipboard_in(
 /// 名字是**净化过**的：远端来的文件名可能有路径分隔符（恶意或笔误），
 /// 直接拼路径会写到目录之外——按文件名处理。
 ///
-/// 注意：这个「加序号」只能用在**用户看不见的位置**（缓存目录）或
-/// 确实需要保留两份的场合。挂剪贴板走的是 [`save_for_clipboard`]——
-/// 序号一旦进到文件名里，用户粘出来就是带序号的。
+/// 序号只在「同一批里真有两个同名文件」时才出现：跨批已经由
+/// [`staging_root`] 的子目录隔开了，用户粘出来永远是远端原名。
 fn save_into(
 	downloads: &std::path::Path,
 	name: &str,
@@ -4339,42 +4531,48 @@ mod file_clipboard_tests {
 		assert!(super::worth_syncing(" 中 "), "带空白但有实义的内容要保留");
 	}
 
-	/// 挂剪贴板的落盘**绝不改名**：同名内容不同就存缓存目录，名字照旧。
+	/// 挂剪贴板的落盘：**每批一个目录、名字绝不改**。
 	///
-	/// 真机反馈：远端复制 `b.txt`、mac 上粘贴出来却是 `b (4).txt`。
-	/// 根因是落盘走「重名加序号」，序号进了文件名 → 粘出来就带序号，
-	/// 再粘一次 Finder 又加一层。
+	/// 老实现落在「下载」目录，同名冲突只能靠 ` (1)` 序号区分，序号进了
+	/// 文件名 → 用户粘出来就是 `b (4).txt`（真机反馈过）。
+	/// 现在每批一个缓存子目录：跨批永不重名，文件名始终是远端原名，
+	/// 而且用户目录（下载）里一个文件都不多。
 	#[test]
-	fn clipboard_save_never_renames() {
-		let dir = tempfile::tempdir().expect("临时目录");
-		let downloads = dir.path().join("Downloads");
-		let cache = dir.path().join("cache");
-		std::fs::create_dir_all(&downloads).unwrap();
+	fn clipboard_save_keeps_remote_name_per_batch() {
+		let root = tempfile::tempdir().expect("临时目录");
 
-		// 下载目录里先有一份**内容不同**的同名文件
-		std::fs::write(downloads.join("b.txt"), b"old").unwrap();
+		// 两批各写一个**同名不同内容**的文件
+		let batch1 = root.path().join("1");
+		let batch2 = root.path().join("2");
+		let first = super::save_for_clipboard(&batch1, "b.txt", b"old").expect("应能落盘");
+		let second = super::save_for_clipboard(&batch2, "b.txt", b"new").expect("应能落盘");
 
-		let path = super::save_for_clipboard_in(&downloads, &cache, "b.txt", b"new")
-			.expect("应能落盘");
-		assert_eq!(
-			path.file_name().unwrap().to_string_lossy(),
-			"b.txt",
-			"剪贴板里的文件名必须和远端一致"
-		);
-		assert!(path.starts_with(&cache), "同名冲突时要落到缓存目录，不覆盖下载里的原文件");
-		assert_eq!(
-			std::fs::read(downloads.join("b.txt")).unwrap(),
-			b"old",
-			"下载目录里的原文件不能被覆盖"
-		);
+		assert_eq!(first.file_name().unwrap().to_string_lossy(), "b.txt");
+		assert_eq!(second.file_name().unwrap().to_string_lossy(), "b.txt");
+		assert_ne!(first, second, "跨批必须是不同文件");
+		assert_eq!(std::fs::read(&first).unwrap(), b"old", "旧批内容不能被覆盖");
+		assert_eq!(std::fs::read(&second).unwrap(), b"new");
 
-		// 内容一致的第二次：复用下载目录里那份，且不再产生副本
-		let another = super::save_for_clipboard_in(&downloads, &cache, "c.txt", b"same")
-			.expect("应能落盘");
-		let again = super::save_for_clipboard_in(&downloads, &cache, "c.txt", b"same")
-			.expect("应能落盘");
-		assert_eq!(another, again);
-		assert_eq!(another.file_name().unwrap().to_string_lossy(), "c.txt");
+		// 同一批里同名同内容 → 复用，不产生第二份
+		let again = super::save_for_clipboard(&batch2, "b.txt", b"new").expect("应能落盘");
+		assert_eq!(again, second);
+		assert_eq!(std::fs::read_dir(&batch2).unwrap().count(), 1);
+	}
+
+	/// 清旧批次：把中转目录里的历史子目录都干掉。
+	#[test]
+	fn clear_staging_removes_old_batches() {
+		let root = tempfile::tempdir().expect("临时目录");
+		let old = root.path().join("1000");
+		let stale = root.path().join("2000");
+		std::fs::create_dir_all(&old).unwrap();
+		std::fs::create_dir_all(&stale).unwrap();
+		std::fs::write(old.join("a.txt"), b"x").unwrap();
+
+		super::clear_staging(root.path());
+
+		assert!(!old.exists() && !stale.exists(), "旧批次都要清掉");
+		assert!(root.path().exists(), "根目录本身不能删");
 	}
 
 	/// 远端文件名的路径成分必须被剥掉——只落文件名，不越出目标目录。

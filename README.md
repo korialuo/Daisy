@@ -122,6 +122,7 @@ Windows 用 DPAPI（真随机的密钥，绑定当前 Windows 用户）。这条
 | `DAISY_SMOKE_MS` | 指定毫秒后自动关窗；窗口固定到 (80,80) 便于自动化截图 |
 | `DAISY_SMOKE_AUTOCONNECT` | 启动后自动连接指定名称的主机（走与双击完全相同的那条路径） |
 | `DAISY_SMOKE_RDP_SCALE` | 强制 RDP 会话的初始缩放档（`fit`/`fill`/`actual`/`custom`），用于逐档截图核对 |
+| `DAISY_SMOKE_RDP_DETACH` | 出图后自动把画面独立到单独窗口，用于核对弹窗与全屏 |
 | `DAISY_SMOKE_RDP_KEY` | 会话出图后注入输入：`win+r` 发按键、`move:x,y` 把指针移到指定桌面坐标（用于验证光标位置） |
 | `DAISY_SMOKE_OPEN` | 启动即打开某个窗口：`settings` / `new-host` / `new-proxy` / `edit-host:<名称>`。用于无人值守核对窗口布局 |
 | `DAISY_SEED_PASSWORD` | `seed_host` 示例读口令用（口令不进命令行，避免被 `ps` 看到） |

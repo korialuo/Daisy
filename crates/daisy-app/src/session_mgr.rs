@@ -456,6 +456,18 @@ impl SessionManager {
 		})
 	}
 
+	/// 每帧渲染所有「弹出去」的 RDP 桌面。
+	///
+	/// **不能挂在 `ui_active` 上**：那里只跑当前激活的标签页，用户切走之后
+	/// 弹出去的窗口会因为「本帧没画到」被 egui 关掉。
+	pub fn detached_viewports(&mut self, ctx: &egui::Context) {
+		for tab in &mut self.tabs {
+			if let TabState::Live(TabContent::Rdp(view)) = &mut tab.state {
+				view.detached_pass(ctx);
+			}
+		}
+	}
+
 	/// 画活动标签页的内容（放中央面板）。
 	pub fn ui_active(&mut self, ui: &mut egui::Ui) -> Option<RdpAction> {
 		if self.tabs.is_empty() {
