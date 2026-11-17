@@ -1262,11 +1262,7 @@ mod tests {
 
 	/// 合成一帧，事件就是 `events`。
 	#[cfg(unix)]
-	fn pass_with_events(
-		ctx: &egui::Context,
-		view: &mut TerminalView,
-		events: Vec<egui::Event>,
-	) {
+	fn pass_with_events(ctx: &egui::Context, view: &mut TerminalView, events: Vec<egui::Event>) {
 		let input = egui::RawInput {
 			screen_rect: test_screen(),
 			events,
@@ -1377,7 +1373,11 @@ mod tests {
 			shift: true,
 			..egui::Modifiers::default()
 		};
-		pass_with_events(&ctx, &mut view, vec![key_down(egui::Key::Tab, shift, false)]);
+		pass_with_events(
+			&ctx,
+			&mut view,
+			vec![key_down(egui::Key::Tab, shift, false)],
+		);
 
 		assert_eq!(written_bytes(&written), b"\x1b[Z");
 		assert_eq!(ctx.memory(|memory| memory.focused()), focused_before);
@@ -1422,7 +1422,11 @@ mod tests {
 			pass_with_events(
 				&ctx,
 				&mut view,
-				vec![key_down(egui::Key::Backspace, egui::Modifiers::default(), true)],
+				vec![key_down(
+					egui::Key::Backspace,
+					egui::Modifiers::default(),
+					true,
+				)],
 			);
 		}
 
@@ -1443,10 +1447,18 @@ mod tests {
 		pass_with_events(
 			&ctx,
 			&mut view,
-			vec![key_down(egui::Key::Escape, egui::Modifiers::default(), false)],
+			vec![key_down(
+				egui::Key::Escape,
+				egui::Modifiers::default(),
+				false,
+			)],
 		);
 
-		assert_eq!(written_bytes(&written), vec![0x1B], "Esc 应当进 shell（vim 靠它）");
+		assert_eq!(
+			written_bytes(&written),
+			vec![0x1B],
+			"Esc 应当进 shell（vim 靠它）"
+		);
 		assert_eq!(ctx.memory(|memory| memory.focused()), focused_before);
 	}
 
@@ -1539,7 +1551,8 @@ mod tests {
 		let mut view = TerminalView::attach(&ctx, Box::new(link), "川江-326").expect("挂载失败");
 
 		// 远端把标题改成一段又长又带路径的字符串
-		view.session.inject(b"\x1b]0;root@VM-0-2:~/cert/scskj.net\x07");
+		view.session
+			.inject(b"\x1b]0;root@VM-0-2:~/cert/scskj.net\x07");
 		pass_with_events(&ctx, &mut view, Vec::new());
 
 		assert_eq!(view.title(), "川江-326", "标题应固定在建视图时给的名字");
@@ -1764,7 +1777,6 @@ mod tests {
 	}
 }
 
-
 #[cfg(test)]
 mod appearance_tests {
 	use daisy_term::CellMetrics;
@@ -1832,8 +1844,8 @@ mod appearance_tests {
 		// 字体要跑过一帧才可用（`Context::fonts_mut` 在那之前会 panic）
 		frame(&ctx);
 
-		let mut view = TerminalView::attach(&ctx, Box::new(SilentLink), "假链路")
-			.expect("挂载失败");
+		let mut view =
+			TerminalView::attach(&ctx, Box::new(SilentLink), "假链路").expect("挂载失败");
 		view.session.inject(b"Movies\t\tOrbStack");
 
 		let before = view.session.snapshot();

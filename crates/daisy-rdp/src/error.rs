@@ -73,6 +73,13 @@ pub enum RdpError {
 	/// 输入注入失败（按键 / 指针 / 滚轮没能发出去）。
 	#[error("RDP 输入注入失败：{0}")]
 	Input(String),
+
+	/// 平台相关的初始化失败（目前只有 Windows 的 WinSock）。
+	///
+	/// 单独一类而不是塞进 `Gdi` / `Connect`：它发生在**协议之前**，
+	/// 报出来时用户该看的是系统环境，不是网络或密码。
+	#[error("RDP 平台初始化失败：{0}")]
+	Platform(String),
 }
 
 /// RDP 层结果别名。

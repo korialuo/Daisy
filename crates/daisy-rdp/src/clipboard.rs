@@ -94,11 +94,10 @@ const UNLOCK_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(120
 /// 收 `ServerFileContentsRequest`（服务端要我们的文件字节）要求
 /// `LOCAL_TO_REMOTE_FILES`；发 `ClientFileContentsRequest`（下载远端文件）
 /// 要求 `REMOTE_TO_LOCAL_FILES`（见 vendored `cliprdr_main.c:318/:952`）。
-pub const FEATURE_MASK_ALL: u32 =
-	CLIPRDR_FLAG_LOCAL_TO_REMOTE
-		| CLIPRDR_FLAG_REMOTE_TO_LOCAL
-		| CLIPRDR_FLAG_LOCAL_TO_REMOTE_FILES
-		| CLIPRDR_FLAG_REMOTE_TO_LOCAL_FILES;
+pub const FEATURE_MASK_ALL: u32 = CLIPRDR_FLAG_LOCAL_TO_REMOTE
+	| CLIPRDR_FLAG_REMOTE_TO_LOCAL
+	| CLIPRDR_FLAG_LOCAL_TO_REMOTE_FILES
+	| CLIPRDR_FLAG_REMOTE_TO_LOCAL_FILES;
 
 const CLIPRDR_FLAG_LOCAL_TO_REMOTE: u32 = 0x01;
 const CLIPRDR_FLAG_LOCAL_TO_REMOTE_FILES: u32 = 0x02;
@@ -441,10 +440,7 @@ impl Download {
 		if outstanding.dw_flags == FILECONTENTS_SIZE {
 			// SIZE 响应：8 字节小端 = 服务端给出的文件大小
 			if data.len() < 8 {
-				self.failed = Some(format!(
-					"SIZE 响应只有 {} 字节（应为 8）",
-					data.len()
-				));
+				self.failed = Some(format!("SIZE 响应只有 {} 字节（应为 8）", data.len()));
 				return;
 			}
 			let mut raw = [0u8; 8];
@@ -815,9 +811,7 @@ impl Clipboard {
 				RequestKind::Text(id) | RequestKind::FileDescriptors(id) => id,
 			};
 			let rc = request_format_data(context, format_id);
-			tracing::info!(
-				"[剪贴板] 重试反向取数 formatId=0x{format_id:x}（rc={rc}）"
-			);
+			tracing::info!("[剪贴板] 重试反向取数 formatId=0x{format_id:x}（rc={rc}）");
 		}
 
 		// **文件下载的待发请求**：下载状态机每收一块就排下一块，
@@ -825,11 +819,7 @@ impl Clipboard {
 		if let Some(context) = context.as_mut() {
 			// 第一块请求之前先锁住这份文件流（见 `DOWNLOAD_CLIP_DATA_ID`）。
 			// 顺序必须锁在前：Windows rdpclip 见到没有锁的取数请求不认。
-			let need_lock = self
-				.lock()
-				.download
-				.as_ref()
-				.is_some_and(|d| !d.lock_sent);
+			let need_lock = self.lock().download.as_ref().is_some_and(|d| !d.lock_sent);
 			if need_lock {
 				let rc = send_lock_clipdata(context, DOWNLOAD_CLIP_DATA_ID);
 				tracing::info!(
@@ -1173,9 +1163,7 @@ unsafe extern "C" fn server_capabilities_trampoline(
 		capability_set_type: CB_CAPSTYPE_GENERAL,
 		capability_set_length: 12,
 		version: CB_CAPS_VERSION_2,
-		general_flags: CB_USE_LONG_FORMAT_NAMES
-			| CB_STREAM_FILECLIP_ENABLED
-			| CB_CAN_LOCK_CLIPDATA,
+		general_flags: CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED | CB_CAN_LOCK_CLIPDATA,
 	};
 	let reply = ffi::CLIPRDR_CAPABILITIES {
 		common: cliprdr_header(CB_CLIP_CAPS, 0, 4 + 12),
@@ -1387,8 +1375,7 @@ unsafe extern "C" fn server_format_data_response_trampoline(
 		// rdpclip 时序：广播刚到时系统剪贴板可能还没填好，应答就是空的。
 		// 此刻放弃＝用户看到「远端复制了但这边没反应」，所以隔一会儿再问。
 		let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
-		if matches!(guard.requested, Some(RequestKind::FileDescriptors(_)))
-			&& guard.retry_left > 0
+		if matches!(guard.requested, Some(RequestKind::FileDescriptors(_))) && guard.retry_left > 0
 		{
 			guard.retry_left -= 1;
 			guard.retry_at = Some(std::time::Instant::now() + DESCRIPTOR_RETRY_DELAY);
@@ -1404,18 +1391,28 @@ unsafe extern "C" fn server_format_data_response_trampoline(
 	// SAFETY: requestedFormatData/dataLen 由 FreeRDP 保证有效。
 	let bytes = unsafe { std::slice::from_raw_parts(response.requestedFormatData, len) };
 
-	let kind = state.lock().ok().and_then(|mut guard| guard.requested.take());
+	let kind = state
+		.lock()
+		.ok()
+		.and_then(|mut guard| guard.requested.take());
 
 	match kind {
 		Some(RequestKind::FileDescriptors(_)) => {
 			// 文件描述表：建下载会话；SIZE/RANGE 请求由帧循环发出
 			let entries = parse_file_group_descriptor(bytes);
 			if entries.is_empty() {
-				tracing::warn!("[剪贴板] 远端文件描述表解析不出任何条目（{} 字节）", bytes.len());
+				tracing::warn!(
+					"[剪贴板] 远端文件描述表解析不出任何条目（{} 字节）",
+					bytes.len()
+				);
 				return CHANNEL_RC_OK;
 			}
 			for entry in &entries {
-				tracing::info!("[剪贴板] 远端文件：{}（{}）", entry.name, human_size(entry.size));
+				tracing::info!(
+					"[剪贴板] 远端文件：{}（{}）",
+					entry.name,
+					human_size(entry.size)
+				);
 			}
 			let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
 			guard.remote_data_received = true;
@@ -1423,7 +1420,10 @@ unsafe extern "C" fn server_format_data_response_trampoline(
 			let clip_data_id = Some(DOWNLOAD_CLIP_DATA_ID);
 			match Download::start(entries, clip_data_id) {
 				Ok(download) => {
-					tracing::info!("[剪贴板] 开始下载远端文件（共 {} 个）", download.entries.len());
+					tracing::info!(
+						"[剪贴板] 开始下载远端文件（共 {} 个）",
+						download.entries.len()
+					);
 					guard.download = Some(download);
 				},
 				Err(error) => {
@@ -1650,7 +1650,11 @@ unsafe extern "C" fn server_format_data_request_trampoline(
 				return send_format_data_response_fail(context, format_id);
 			},
 		};
-		tracing::info!("[剪贴板] 文件描述表 {} 字节（{} 个条目）", bytes.len(), files.len());
+		tracing::info!(
+			"[剪贴板] 文件描述表 {} 字节（{} 个条目）",
+			bytes.len(),
+			files.len()
+		);
 		return send_format_data_response(context, format_id, &bytes);
 	}
 	// `FileContents` 格式本身没有 FormatData 载荷——内容走 FileContentsRequest。
@@ -1921,8 +1925,7 @@ fn parse_file_group_descriptor(bytes: &[u8]) -> Vec<FileEntry> {
 			break;
 		};
 		let dw_flags = u32::from_le_bytes(descriptor[0..4].try_into().expect("4 字节"));
-		let attributes =
-			u32::from_le_bytes(descriptor[36..40].try_into().expect("4 字节"));
+		let attributes = u32::from_le_bytes(descriptor[36..40].try_into().expect("4 字节"));
 		let size_high = u32::from_le_bytes(descriptor[64..68].try_into().expect("4 字节"));
 		let size_low = u32::from_le_bytes(descriptor[68..72].try_into().expect("4 字节"));
 		let size = (u64::from(size_high) << 32) | u64::from(size_low);
@@ -1938,15 +1941,10 @@ fn parse_file_group_descriptor(bytes: &[u8]) -> Vec<FileEntry> {
 		if name.is_empty() {
 			continue;
 		}
-		let is_dir =
-			dw_flags & FD_ATTRIBUTES != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+		let is_dir = dw_flags & FD_ATTRIBUTES != 0 && attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
 		entries.push(FileEntry {
 			name: format!("{}{name}", if is_dir { "[目录] " } else { "" }),
-			size: if dw_flags & FD_FILESIZE != 0 {
-				size
-			} else {
-				0
-			},
+			size: if dw_flags & FD_FILESIZE != 0 { size } else { 0 },
 		});
 	}
 	entries
@@ -2009,7 +2007,10 @@ unsafe extern "C" fn server_lock_clipdata_trampoline(
 	// 一个字节都不回。
 	// 记下锁定的 clipDataId——下载文件字节时要随请求带回（见
 	// `server_clip_data_id` 字段说明）。
-	tracing::info!("[剪贴板] 服务端锁定 clipDataId={}（下载请求将随带）", lock_data.clipDataId);
+	tracing::info!(
+		"[剪贴板] 服务端锁定 clipDataId={}（下载请求将随带）",
+		lock_data.clipDataId
+	);
 	// SAFETY: context 由 FreeRDP 传入，有效。
 	let state = unsafe { state_of(context) };
 	if let Ok(mut guard) = state.lock() {
@@ -2025,7 +2026,10 @@ unsafe extern "C" fn server_unlock_clipdata_trampoline(
 ) -> ffi::UINT {
 	note_server_message(unsafe { state_of(context) }, "解锁");
 	if let Some(unlock_data) = unsafe { unlock_data.as_ref() } {
-		tracing::info!("[剪贴板] 服务端解锁文件流 clipDataId={}", unlock_data.clipDataId);
+		tracing::info!(
+			"[剪贴板] 服务端解锁文件流 clipDataId={}",
+			unlock_data.clipDataId
+		);
 		// SAFETY: context 由 FreeRDP 传入，有效。
 		let state = unsafe { state_of(context) };
 		if let Ok(mut guard) = state.lock()
@@ -2055,8 +2059,7 @@ unsafe extern "C" fn server_file_contents_request_trampoline(
 	note_server_message(unsafe { state_of(context) }, "文件内容请求");
 	let stream_id = request.streamId;
 	let list_index = request.listIndex;
-	let position =
-		u64::from(request.nPositionHigh) << 32 | u64::from(request.nPositionLow);
+	let position = u64::from(request.nPositionHigh) << 32 | u64::from(request.nPositionLow);
 
 	// SAFETY: context 有效。
 	let state = unsafe { state_of(context) };
@@ -2087,7 +2090,9 @@ unsafe extern "C" fn server_file_contents_request_trampoline(
 		);
 		drop(guard);
 		// SAFETY: context 有效。
-		return unsafe { send_file_contents_response(&mut *context, stream_id, CB_RESPONSE_FAIL, &[]) };
+		return unsafe {
+			send_file_contents_response(&mut *context, stream_id, CB_RESPONSE_FAIL, &[])
+		};
 	};
 
 	if request.dwFlags & FILECONTENTS_SIZE != 0 {
@@ -2105,10 +2110,15 @@ unsafe extern "C" fn server_file_contents_request_trampoline(
 	}
 
 	if request.dwFlags & FILECONTENTS_RANGE == 0 {
-		tracing::warn!("[剪贴板] FileContentsRequest 的 dwFlags 不认识：0x{:x}", request.dwFlags);
+		tracing::warn!(
+			"[剪贴板] FileContentsRequest 的 dwFlags 不认识：0x{:x}",
+			request.dwFlags
+		);
 		drop(guard);
 		// SAFETY: context 有效。
-		return unsafe { send_file_contents_response(&mut *context, stream_id, CB_RESPONSE_FAIL, &[]) };
+		return unsafe {
+			send_file_contents_response(&mut *context, stream_id, CB_RESPONSE_FAIL, &[])
+		};
 	}
 
 	// RANGE：现读文件的一段。读失败（文件被删/被移动）回 FAIL——
@@ -2129,9 +2139,7 @@ unsafe extern "C" fn server_file_contents_request_trampoline(
 		Err(error) => {
 			tracing::warn!("[剪贴板] 读「{}」失败：{error}", file.name);
 			// SAFETY: context 有效。
-			unsafe {
-				send_file_contents_response(&mut *context, stream_id, CB_RESPONSE_FAIL, &[])
-			}
+			unsafe { send_file_contents_response(&mut *context, stream_id, CB_RESPONSE_FAIL, &[]) }
 		},
 	}
 }
@@ -2564,10 +2572,7 @@ mod tests {
 			Some("后来的".to_string()),
 			"在途未完成时不该取走新文本"
 		);
-		assert_eq!(
-			sending_text(&state),
-			Some("在途".to_string())
-		);
+		assert_eq!(sending_text(&state), Some("在途".to_string()));
 	}
 
 	/// **回归**：`FEATURE_MASK_ALL` 必须是 0x33（文本两位 + 文件两位）。
@@ -3276,10 +3281,13 @@ mod file_clipboard_tests {
 	fn descriptor_parse_respects_payload_bounds() {
 		let mut bytes = Vec::new();
 		bytes.extend_from_slice(&999u32.to_le_bytes()); // 谎报 999 个条目
-		append_file_descriptor(&mut bytes, &FileEntry {
-			name: "only.txt".into(),
-			size: 1,
-		});
+		append_file_descriptor(
+			&mut bytes,
+			&FileEntry {
+				name: "only.txt".into(),
+				size: 1,
+			},
+		);
 		let entries = parse_file_group_descriptor(&bytes);
 		assert_eq!(entries.len(), 1, "载荷只装得下 1 个条目");
 		assert_eq!(entries[0].name, "only.txt");
@@ -3288,16 +3296,19 @@ mod file_clipboard_tests {
 	/// 下载状态机：描述表 size 直接驱动 RANGE × N；streamId 对不上要丢弃。
 	#[test]
 	fn download_assembles_files_in_order() {
-		let mut download = Download::start(vec![
-			FileEntry {
-				name: "a.bin".into(),
-				size: 10,
-			},
-			FileEntry {
-				name: "b.bin".into(),
-				size: 5,
-			},
-		], None)
+		let mut download = Download::start(
+			vec![
+				FileEntry {
+					name: "a.bin".into(),
+					size: 10,
+				},
+				FileEntry {
+					name: "b.bin".into(),
+					size: 5,
+				},
+			],
+			None,
+		)
 		.expect("应能开始");
 
 		// 第一条：文件 0 的 SIZE（cbRequested 恒为 8）
@@ -3355,16 +3366,19 @@ mod file_clipboard_tests {
 	/// 直接收进结果。
 	#[test]
 	fn download_skips_empty_files_without_requests() {
-		let mut download = Download::start(vec![
-			FileEntry {
-				name: "空.txt".into(),
-				size: 0,
-			},
-			FileEntry {
-				name: "有.bin".into(),
-				size: 3,
-			},
-		], None)
+		let mut download = Download::start(
+			vec![
+				FileEntry {
+					name: "空.txt".into(),
+					size: 0,
+				},
+				FileEntry {
+					name: "有.bin".into(),
+					size: 3,
+				},
+			],
+			None,
+		)
 		.expect("应能开始");
 
 		// 第一个请求必须是文件 1（下标 1）的 SIZE——空文件 0 已静默完成
@@ -3388,20 +3402,26 @@ mod file_clipboard_tests {
 	/// 下载失败路径：CB_RESPONSE_FAIL 与超限都要置失败位。
 	#[test]
 	fn download_fails_loudly() {
-		let mut download = Download::start(vec![FileEntry {
-			name: "x".into(),
-			size: 10,
-		}], None)
+		let mut download = Download::start(
+			vec![FileEntry {
+				name: "x".into(),
+				size: 10,
+			}],
+			None,
+		)
 		.unwrap();
 		let request = download.pop_request().unwrap();
 		download.on_response(request.stream_id, false, &[]);
 		assert!(download.failed.is_some(), "FAIL 要置失败位");
 		assert!(download.take_result().is_none(), "失败后没有结果");
 
-		let too_big = Download::start(vec![FileEntry {
-			name: "huge.iso".into(),
-			size: MAX_FILE_SIZE + 1,
-		}], None);
+		let too_big = Download::start(
+			vec![FileEntry {
+				name: "huge.iso".into(),
+				size: MAX_FILE_SIZE + 1,
+			}],
+			None,
+		);
 		assert!(too_big.is_err(), "超过内存上限要直接拒绝");
 	}
 
@@ -3457,7 +3477,10 @@ mod file_clipboard_tests {
 		// 内容必须留在 sending 里等远端来要
 		let state = clipboard.state.lock().unwrap();
 		assert!(
-			matches!(state.sending.as_ref().map(|(c, _)| c), Some(Content::Files(_))),
+			matches!(
+				state.sending.as_ref().map(|(c, _)| c),
+				Some(Content::Files(_))
+			),
 			"文件要留在 sending 等服务端索要"
 		);
 	}
@@ -3492,8 +3515,8 @@ mod file_clipboard_tests {
 			0
 		}
 		ctx.ClientFormatDataResponse = Some(on_response);
-		ctx.custom = std::sync::Arc::as_ptr(&clipboard.state)
-			as *mut PluginData as *mut std::ffi::c_void;
+		ctx.custom =
+			std::sync::Arc::as_ptr(&clipboard.state) as *mut PluginData as *mut std::ffi::c_void;
 
 		{
 			let mut state = clipboard.state.lock().unwrap();
@@ -3563,8 +3586,8 @@ mod file_clipboard_tests {
 			0
 		}
 		ctx.ClientFileContentsResponse = Some(on_response);
-		ctx.custom = std::sync::Arc::as_ptr(&clipboard.state)
-			as *mut PluginData as *mut std::ffi::c_void;
+		ctx.custom =
+			std::sync::Arc::as_ptr(&clipboard.state) as *mut PluginData as *mut std::ffi::c_void;
 
 		{
 			let mut state = clipboard.state.lock().unwrap();
@@ -3628,8 +3651,8 @@ mod file_clipboard_tests {
 	fn empty_descriptor_response_is_retried_once() {
 		let clipboard = Clipboard::new();
 		let mut ctx: ffi::CliprdrClientContext = unsafe { std::mem::zeroed() };
-		ctx.custom = std::sync::Arc::as_ptr(&clipboard.state)
-			as *mut PluginData as *mut std::ffi::c_void;
+		ctx.custom =
+			std::sync::Arc::as_ptr(&clipboard.state) as *mut PluginData as *mut std::ffi::c_void;
 
 		{
 			let mut state = clipboard.state.lock().unwrap();
@@ -3694,8 +3717,8 @@ mod file_clipboard_tests {
 		}
 		ctx.ClientFormatDataRequest = Some(on_format_data_request);
 		ctx.ClientFileContentsRequest = Some(on_file_contents_request);
-		ctx.custom = std::sync::Arc::as_ptr(&clipboard.state)
-			as *mut PluginData as *mut std::ffi::c_void;
+		ctx.custom =
+			std::sync::Arc::as_ptr(&clipboard.state) as *mut PluginData as *mut std::ffi::c_void;
 
 		// 1. 服务端广播：文本格式 + FileGroupDescriptorW（ID 服务端自定）
 		let mut c_name = b"FileGroupDescriptorW\0".to_vec();
@@ -3732,16 +3755,26 @@ mod file_clipboard_tests {
 		// 3. 服务端回描述表：两个文件
 		let mut payload = Vec::new();
 		payload.extend_from_slice(&2u32.to_le_bytes());
-		append_file_descriptor(&mut payload, &FileEntry {
-			name: "甲.txt".into(),
-			size: 4,
-		});
-		append_file_descriptor(&mut payload, &FileEntry {
-			name: "乙.txt".into(),
-			size: 3,
-		});
+		append_file_descriptor(
+			&mut payload,
+			&FileEntry {
+				name: "甲.txt".into(),
+				size: 4,
+			},
+		);
+		append_file_descriptor(
+			&mut payload,
+			&FileEntry {
+				name: "乙.txt".into(),
+				size: 3,
+			},
+		);
 		let response = ffi::CLIPRDR_FORMAT_DATA_RESPONSE {
-			common: cliprdr_header(CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, payload.len() as u32),
+			common: cliprdr_header(
+				CB_FORMAT_DATA_RESPONSE,
+				CB_RESPONSE_OK,
+				payload.len() as u32,
+			),
 			requestedFormatData: payload.as_ptr(),
 		};
 		unsafe { server_format_data_response_trampoline(&mut ctx as *mut _, &response) };

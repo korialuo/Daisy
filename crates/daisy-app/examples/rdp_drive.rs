@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use daisy_core::config::AppPaths;
 use daisy_core::key::EmbeddedKey;
-use daisy_rdp::{to_rgba, ConnectionParams, InputEvent, Key, RdpClient};
+use daisy_rdp::{ConnectionParams, InputEvent, Key, RdpClient, to_rgba};
 use daisy_store::Database;
 
 /// 一次按键组合，例如 `win+r`。

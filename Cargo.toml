@@ -55,10 +55,11 @@ tempfile = "3.27"
 # 版本在此统一锁定，对应 crate 引用时直接 .workspace = true 即可。
 rand = "0.10"
 
-# Windows 专有 API（DPAPI、exe 资源）。只在 cfg(windows) 下引用，
-# 其它平台完全不编译，因此不影响 macOS 构建。
+# Windows 专有 API（DPAPI、WinSock 初始化、exe 资源）。只在 cfg(windows)
+# 下引用，其它平台完全不编译，因此不影响 macOS 构建。
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Networking_WinSock",
     "Win32_Security_Cryptography",
     "Win32_System_Memory",
 ] }

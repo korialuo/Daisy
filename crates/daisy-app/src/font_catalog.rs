@@ -132,7 +132,8 @@ fn font_dirs() -> Vec<PathBuf> {
 	let mut dirs = Vec::new();
 
 	if cfg!(target_os = "windows") {
-		let windir = std::env::var_os("WINDIR").map_or_else(|| PathBuf::from("C:/Windows"), PathBuf::from);
+		let windir =
+			std::env::var_os("WINDIR").map_or_else(|| PathBuf::from("C:/Windows"), PathBuf::from);
 		dirs.push(windir.join("Fonts"));
 		// 当前用户装的字体（免管理员安装，Office 之类常放这里）
 		if let Some(appdata) = std::env::var_os("LOCALAPPDATA") {
@@ -427,12 +428,17 @@ fn glyph_from_format4(sub: &[u8], code: u32) -> Option<u16> {
 	let range_at = delta_at + seg_count * 2;
 
 	for index in 0..seg_count {
-		let end = u16::from_be_bytes([*sub.get(end_at + index * 2)?, *sub.get(end_at + index * 2 + 1)?]);
+		let end = u16::from_be_bytes([
+			*sub.get(end_at + index * 2)?,
+			*sub.get(end_at + index * 2 + 1)?,
+		]);
 		if code > end {
 			continue;
 		}
-		let start =
-			u16::from_be_bytes([*sub.get(start_at + index * 2)?, *sub.get(start_at + index * 2 + 1)?]);
+		let start = u16::from_be_bytes([
+			*sub.get(start_at + index * 2)?,
+			*sub.get(start_at + index * 2 + 1)?,
+		]);
 		if code < start {
 			return None;
 		}
@@ -449,10 +455,7 @@ fn glyph_from_format4(sub: &[u8], code: u32) -> Option<u16> {
 			return Some((i32::from(code) + i32::from(delta)) as u16);
 		}
 
-		let at = range_at
-			+ index * 2
-			+ range_offset as usize
-			+ (code - start) as usize * 2;
+		let at = range_at + index * 2 + range_offset as usize + (code - start) as usize * 2;
 		let glyph = u16::from_be_bytes([*sub.get(at)?, *sub.get(at + 1)?]);
 		if glyph == 0 {
 			return None;
@@ -464,17 +467,23 @@ fn glyph_from_format4(sub: &[u8], code: u32) -> Option<u16> {
 }
 
 fn glyph_from_format12(sub: &[u8], code: u32) -> Option<u16> {
-	let groups = u32::from_be_bytes([
-		*sub.get(12)?,
-		*sub.get(13)?,
-		*sub.get(14)?,
-		*sub.get(15)?,
-	]) as usize;
+	let groups =
+		u32::from_be_bytes([*sub.get(12)?, *sub.get(13)?, *sub.get(14)?, *sub.get(15)?]) as usize;
 
 	for index in 0..groups {
 		let at = 16 + index * 12;
-		let start = u32::from_be_bytes([*sub.get(at)?, *sub.get(at + 1)?, *sub.get(at + 2)?, *sub.get(at + 3)?]);
-		let end = u32::from_be_bytes([*sub.get(at + 4)?, *sub.get(at + 5)?, *sub.get(at + 6)?, *sub.get(at + 7)?]);
+		let start = u32::from_be_bytes([
+			*sub.get(at)?,
+			*sub.get(at + 1)?,
+			*sub.get(at + 2)?,
+			*sub.get(at + 3)?,
+		]);
+		let end = u32::from_be_bytes([
+			*sub.get(at + 4)?,
+			*sub.get(at + 5)?,
+			*sub.get(at + 6)?,
+			*sub.get(at + 7)?,
+		]);
 		let glyph = u32::from_be_bytes([
 			*sub.get(at + 8)?,
 			*sub.get(at + 9)?,
@@ -544,7 +553,10 @@ fn name_string(data: &[u8], ids: &[u16]) -> Option<String> {
 		};
 		let score = (id_rank as u8) * 4 + locale_rank;
 
-		if best.as_ref().is_none_or(|(best_score, _)| score < *best_score) {
+		if best
+			.as_ref()
+			.is_none_or(|(best_score, _)| score < *best_score)
+		{
 			best = Some((score, text));
 		}
 	}
@@ -569,7 +581,11 @@ mod tests {
 	#[test]
 	fn font_dirs_are_absolute() {
 		for dir in font_dirs() {
-			assert!(dir.is_absolute(), "字体目录应当是绝对路径：{}", dir.display());
+			assert!(
+				dir.is_absolute(),
+				"字体目录应当是绝对路径：{}",
+				dir.display()
+			);
 		}
 	}
 
@@ -597,10 +613,7 @@ mod tests {
 		push_record(&mut data, 1, 0, 0, 1, mac.len(), 0);
 		// 记录 2：Windows 英文，家族名 "WinFamily"（UTF-16BE，18 字节）
 		let win: String = "WinFamily".to_string();
-		let win_bytes: Vec<u8> = win
-			.encode_utf16()
-			.flat_map(u16::to_be_bytes)
-			.collect();
+		let win_bytes: Vec<u8> = win.encode_utf16().flat_map(u16::to_be_bytes).collect();
 		push_record(&mut data, 3, 1, 0x0409, 1, win_bytes.len(), mac.len());
 		data.extend_from_slice(mac);
 		data.extend_from_slice(&win_bytes);

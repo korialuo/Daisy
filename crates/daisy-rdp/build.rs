@@ -181,18 +181,18 @@ fn windows_include_dirs() -> Vec<PathBuf> {
 	}
 
 	let mut dirs = Vec::new();
-	if let Some(vs) = vswhere_install_path() {
-		if let Some(msvc) = newest_dir(&vs.join("VC/Tools/MSVC")) {
-			dirs.push(msvc.join("include"));
-		}
+	if let Some(msvc) = vswhere_install_path().and_then(|vs| newest_dir(&vs.join("VC/Tools/MSVC")))
+	{
+		dirs.push(msvc.join("include"));
 	}
-	if let Ok(pf86) = env::var("ProgramFiles(x86)") {
-		if let Some(kits) = newest_dir(&PathBuf::from(pf86).join("Windows Kits/10/Include")) {
-			for sub in ["ucrt", "shared", "um", "winrt"] {
-				let dir = kits.join(sub);
-				if dir.is_dir() {
-					dirs.push(dir);
-				}
+	if let Some(kits) = env::var("ProgramFiles(x86)")
+		.ok()
+		.and_then(|pf86| newest_dir(&PathBuf::from(pf86).join("Windows Kits/10/Include")))
+	{
+		for sub in ["ucrt", "shared", "um", "winrt"] {
+			let dir = kits.join(sub);
+			if dir.is_dir() {
+				dirs.push(dir);
 			}
 		}
 	}

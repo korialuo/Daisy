@@ -328,7 +328,6 @@ impl SshParams {
 		self.rsa = policy;
 		self
 	}
-
 }
 
 /// 主机密钥核对策略。

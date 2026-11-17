@@ -33,8 +33,7 @@ fn font_row(ui: &mut egui::Ui, label: &str, monospaced: bool, selected: bool) ->
 	// 下拉里的 `ScrollArea` 在某些布局下会把可用宽度报成无穷大，
 	// 直接拿去 allocate 会让弹层宽度炸开
 	let width = ui.available_width().clamp(120.0, 640.0);
-	let (rect, response) =
-		ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+	let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
 
 	if selected {
 		ui.painter().rect_filled(rect, 4, tokens.bg_active);
@@ -42,13 +41,15 @@ fn font_row(ui: &mut egui::Ui, label: &str, monospaced: bool, selected: bool) ->
 		ui.painter().rect_filled(rect, 4, tokens.bg_hover);
 	}
 
-	let color = if selected { tokens.text } else { tokens.text_dim };
+	let color = if selected {
+		tokens.text
+	} else {
+		tokens.text_dim
+	};
 	let name_left = rect.left() + 8.0;
-	let galley = ui.painter().layout_no_wrap(
-		label.to_owned(),
-		egui::FontId::proportional(13.0),
-		color,
-	);
+	let galley =
+		ui.painter()
+			.layout_no_wrap(label.to_owned(), egui::FontId::proportional(13.0), color);
 	ui.painter().galley(
 		egui::pos2(name_left, rect.center().y - galley.size().y * 0.5),
 		galley.clone(),
@@ -285,10 +286,7 @@ mod tests {
 		output.textures_delta.clear();
 
 		for (before, after) in &rows {
-			assert!(
-				after - before >= 21.5,
-				"行高被压扁了：{before} → {after}"
-			);
+			assert!(after - before >= 21.5, "行高被压扁了：{before} → {after}");
 		}
 		for pair in rows.windows(2) {
 			assert!(

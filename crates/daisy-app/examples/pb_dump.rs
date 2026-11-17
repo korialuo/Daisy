@@ -96,7 +96,9 @@ fn main() {
 				let text = if utf8.is_null() {
 					"<nil>".to_string()
 				} else {
-					std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned()
+					std::ffi::CStr::from_ptr(utf8)
+						.to_string_lossy()
+						.into_owned()
 				};
 				println!("  - {text}");
 			}
@@ -155,10 +157,7 @@ fn main() {
 
 	// 文本侧：arboard 在这份剪贴板上读到什么（决定文件列表会不会被文本覆盖）
 	match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-		Ok(text) => println!(
-			"arboard text = {text:?}（{} 字）",
-			text.chars().count()
-		),
+		Ok(text) => println!("arboard text = {text:?}（{} 字）", text.chars().count()),
 		Err(error) => println!("arboard text: {error}"),
 	}
 

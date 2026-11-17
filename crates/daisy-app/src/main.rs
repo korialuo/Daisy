@@ -50,8 +50,8 @@ mod design;
 mod error;
 mod font_catalog;
 mod fonts;
-mod placement;
 mod pasteboard_files;
+mod placement;
 mod rdp_session;
 mod session_mgr;
 mod sftp_session;
@@ -1353,8 +1353,13 @@ impl DaisyApp {
 			ConnectionPlan::Rdp(params) => {
 				// 证书指纹在**开连之前**查好交给视图：握手一开始就要用
 				let expected_cert = self.rdp_cert_of(&host.host, host.port);
-				self.sessions
-					.open_rdp(host.name.clone(), params, host.id, host.display, expected_cert);
+				self.sessions.open_rdp(
+					host.name.clone(),
+					params,
+					host.id,
+					host.display,
+					expected_cert,
+				);
 			},
 			ConnectionPlan::Jump {
 				jump,

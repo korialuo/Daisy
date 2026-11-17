@@ -507,7 +507,8 @@ mod tests {
 
 		// 组合中按退格是「改拼音」，不能删远端字符
 		assert!(
-			ime.encode(&[key_event(Key::Backspace)], normalize()).is_empty(),
+			ime.encode(&[key_event(Key::Backspace)], normalize())
+				.is_empty(),
 			"组合中的退格被输入法吃了才对"
 		);
 		// 选词用的空格/回车同理
@@ -525,7 +526,10 @@ mod tests {
 		assert!(!ime.composing());
 
 		// 之后退格恢复正常
-		assert_eq!(ime.encode(&[key_event(Key::Backspace)], normalize()), vec![0x7F]);
+		assert_eq!(
+			ime.encode(&[key_event(Key::Backspace)], normalize()),
+			vec![0x7F]
+		);
 	}
 
 	#[test]

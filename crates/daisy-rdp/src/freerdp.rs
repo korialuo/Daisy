@@ -297,7 +297,6 @@ impl ConnectionParams {
 		self.height = height;
 		self
 	}
-
 }
 
 impl std::fmt::Debug for ConnectionParams {
@@ -418,11 +417,52 @@ fn enable_freerdp_protocol_log() {
 	}
 }
 
+/// Windows 上先初始化 WinSock——**这是 FreeRDP 库的使用者义务**。
+///
+/// FreeRDP 的库里没有任何一处 `WSAStartup`，它只在自带的示例客户端
+/// （`client/Windows/wf_client.c`）里调。没初始化时 `getaddrinfo` 直接失败，
+/// 现象极具误导性：连 `127.0.0.1` 这种字面量都会被判成
+/// `ERRCONNECT_DNS_NAME_NOT_FOUND`，看着像域名解析坏了。
+///
+/// 只在 Windows 下存在；macOS 的 socket 不需要初始化。
+#[cfg(windows)]
+fn ensure_winsock() -> Result<()> {
+	use std::sync::Once;
+	use std::sync::atomic::{AtomicI32, Ordering};
+	use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
+
+	// 进程内只做一次：WSAStartup 是引用计数的，反复调用虽不致命，
+	// 但把结果缓存下来才能保证「第一次失败」被稳定报出来。
+	static ONCE: Once = Once::new();
+	static CODE: AtomicI32 = AtomicI32::new(0);
+
+	ONCE.call_once(|| {
+		let mut data: WSADATA = unsafe { std::mem::zeroed() };
+		// SAFETY: WSADATA 是 POD 结构，WSAStartup 只往里写。
+		let code = unsafe { WSAStartup(0x0202, &mut data) };
+		CODE.store(code, Ordering::Release);
+	});
+
+	match CODE.load(Ordering::Acquire) {
+		0 => Ok(()),
+		code => Err(RdpError::Platform(format!(
+			"WSAStartup 失败（错误码 {code}），系统网络栈不可用"
+		))),
+	}
+}
+
+#[cfg(not(windows))]
+fn ensure_winsock() -> Result<()> {
+	Ok(())
+}
+
 impl RdpClient {
 	/// 创建实例与 context。
 	///
 	/// 这一步只做分配与回调挂载，不建立网络连接。
 	pub fn new() -> Result<Self> {
+		ensure_winsock()?;
+
 		// SAFETY: freerdp_new 无前置条件，返回新实例或 NULL。
 		let instance = unsafe { ffi::freerdp_new() };
 		if instance.is_null() {

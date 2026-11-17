@@ -228,7 +228,11 @@ fn install_terminal_font(
 		"终端字体：{}（{}，{}）",
 		family,
 		font.path.display(),
-		if font.monospaced { "等宽" } else { "非等宽" }
+		if font.monospaced {
+			"等宽"
+		} else {
+			"非等宽"
+		}
 	);
 
 	// 不拦着用户选比例字体，但要说清楚代价：终端按「一个字符一格」记账，
@@ -236,9 +240,7 @@ fn install_terminal_font(
 	if font.monospaced {
 		None
 	} else {
-		Some(format!(
-			"「{family}」不是等宽字体，终端里中英混排会错位"
-		))
+		Some(format!("「{family}」不是等宽字体，终端里中英混排会错位"))
 	}
 }
 

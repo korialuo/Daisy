@@ -11,5 +11,10 @@ daisy-core = { path = "../daisy-core" }
 thiserror.workspace = true
 tracing.workspace = true
 
+# FreeRDP 库不自己调 `WSAStartup`（只在它自己的示例客户端里调），
+# Windows 上必须由使用者初始化 WinSock，否则 `getaddrinfo` 直接失败。
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [build-dependencies]
 bindgen = "0.73"

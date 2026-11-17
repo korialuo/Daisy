@@ -12,8 +12,8 @@
 use std::fmt;
 
 use daisy_core::model::{
-	AuthMethod, DisplaySettings, Host, Protocol, PublicKeyAuth, Resolution, ScaleMode,
-	ScaleSettings, DEFAULT_DPI, validate_dpi,
+	AuthMethod, DEFAULT_DPI, DisplaySettings, Host, Protocol, PublicKeyAuth, Resolution, ScaleMode,
+	ScaleSettings, validate_dpi,
 };
 use rusqlite::{Connection, Row, params};
 use zeroize::Zeroizing;
@@ -406,7 +406,8 @@ fn read_host(row: &Row<'_>) -> Result<Host> {
 		.map_err(|e| StoreError::Format(format!("hosts.scale_factor 取值非法：{e}")))?;
 
 	let dpi = dpi_raw.unwrap_or(i64::from(DEFAULT_DPI));
-	let dpi = u32::try_from(dpi).map_err(|_| StoreError::Format(format!("hosts.dpi 超出范围：{dpi}")))?;
+	let dpi =
+		u32::try_from(dpi).map_err(|_| StoreError::Format(format!("hosts.dpi 超出范围：{dpi}")))?;
 	validate_dpi(dpi).map_err(|e| StoreError::Format(format!("hosts.dpi 取值非法：{e}")))?;
 
 	let port = u16::try_from(port_raw)
@@ -457,7 +458,11 @@ mod tests {
 		)
 		.expect("按最小列集插行失败");
 		let dpi: i64 = conn
-			.query_row("SELECT dpi FROM hosts WHERE name = '迁移前老行'", [], |row| row.get(0))
+			.query_row(
+				"SELECT dpi FROM hosts WHERE name = '迁移前老行'",
+				[],
+				|row| row.get(0),
+			)
 			.expect("读取 dpi 失败");
 		assert_eq!(dpi, 100, "迁移默认值必须是 100");
 	}

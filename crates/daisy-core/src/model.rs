@@ -228,9 +228,7 @@ impl FromStr for Resolution {
 
 		if let Some(size) = raw.strip_prefix("fit-window:") {
 			let (width, height) = size.split_once('x').ok_or_else(|| {
-				CoreError::InvalidConfig(format!(
-					"跟随窗口目标需为 fit-window:宽x高，收到 {raw}"
-				))
+				CoreError::InvalidConfig(format!("跟随窗口目标需为 fit-window:宽x高，收到 {raw}"))
 			})?;
 			let width = width
 				.trim()
@@ -652,9 +650,7 @@ mod tests {
 			"fit-window:2820x1794"
 		);
 		assert_eq!(
-			"fit-window:2820x1794"
-				.parse::<Resolution>()
-				.unwrap(),
+			"fit-window:2820x1794".parse::<Resolution>().unwrap(),
 			Resolution::FitWindowAt {
 				width: 2820,
 				height: 1794

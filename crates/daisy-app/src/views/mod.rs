@@ -216,8 +216,7 @@ pub(crate) fn paint_badge(
 	let width = painter
 		.layout_no_wrap(text.to_owned(), font.clone(), fg)
 		.size()
-		.x
-		+ 8.0;
+		.x + 8.0;
 
 	let rect = egui::Rect::from_min_size(
 		egui::pos2(left, center_y - BADGE_HEIGHT * 0.5),

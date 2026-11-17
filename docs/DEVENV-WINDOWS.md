@@ -217,6 +217,9 @@ tar -xzf C:\dev\src.tar.gz --strip-components=1 -C C:\dev\daisy
 | 链接报 29 个 `LNK2019`（`freerdp_new`、`cliprdr_VirtualChannelEntryEx`…），而 `-L` 搜索路径明明在链接行上 | 静态库被 rustc **bundle 进 rlib**（默认 `+bundle`）。FreeRDP 的 Windows 构建开着 IPO，`freerdp3.lib` 是 92 MB 的 `/GL` 归档，打包再取出后 link.exe 看不到符号；`-l` 不会出现在链接行，只有 `-L` 在——极易误判成「库没找到」 | 改 `cargo:rustc-link-lib=static:-bundle=<名>`（已修）。自查方法：`cargo build -v` 的链接行里搜库名，0 次命中就是被 bundle 了 |
 | 剩 3 个 `LNK2001: remdesk_write_ctl_header` / `remdesk_prepare_ctl_header` / `remdesk_read_channel_header` | 静态 addin 表把 remdesk 通道入口拖进了链接，而这三个辅助函数在**单独安装**的 `remdesk-common.lib` 里，FreeRDP 不把它并进 `freerdp-client3` | 显式链 `remdesk-common`（已修）。注意安装位置：Windows 在 prefix **根目录**，macOS 在 `lib/freerdp3/`——macOS 分支的搜索路径本来就有后者，所以这个坑只在 Windows 上现形 |
 | `Unable to find libclang` | 没装 LLVM 或没设 `LIBCLANG_PATH` | `winget install LLVM.LLVM`；`build-windows.ps1` 会自动探测默认安装路径 |
+| RDP 连不上，日志报 `getaddrinfo(127.0.0.1) failed` / `ERRCONNECT_DNS_NAME_NOT_FOUND (0x00020005)`，**连 IP 字面量都说不存在** | 进程没调 `WSAStartup`。FreeRDP 的库里**一处都没有**它，只在自带的示例客户端（`client/Windows/wf_client.c`）里调——这是使用者的义务 | 已修：`daisy-rdp` 在 `RdpClient::new()` 里用 `Once` 调一次（`winsock.rs` 式封装在 `freerdp.rs::ensure_winsock`）。macOS 不需要，所以这个坑只在 Windows 上现形 |
+| `connect to <主机名>:<端口> failed with error: Unknown error (10061)` | 端口不对，**不是**防火墙。NAT 环境下外部端口 ≠ 本机端口（这台机器外部 53388 → 本机 3389） | 本机自连用 `127.0.0.1:3389`；查法 `netstat -an \| findstr :3389` |
+| 本机自连 RDP 后原会话立刻断，日志 `ERRINFO_RPC_INITIATED_DISCONNECT` | Windows 客户端版只许一个交互式会话，同账号第二次连接会踢掉第一次 | 预期行为。无人值守验证就靠这个：让被踢的会话里跑着的进程继续干完活，事后重连读结果 |
 | 双击 exe 弹黑框 | 缺 `windows_subsystem` | 已修：`crates/daisy-app/src/main.rs` 顶部 |
 | exe 图标是白纸 | `rc.exe` 没跑成功 | 看构建输出里的 `cargo:warning=Windows 资源编译失败` |
 | 终端中文乱码 | ConPTY 按 GBK 转字节 | 已默认设 UTF-8；仍乱就 `$env:DAISY_SHELL='cmd.exe'` 对比 |

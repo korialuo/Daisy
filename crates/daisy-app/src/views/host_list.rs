@@ -383,7 +383,11 @@ fn host_row_ui(
 		badge_bg,
 	);
 
-	clip.galley(egui::pos2(left + badge_width + 6.0, block_top), name, name_color);
+	clip.galley(
+		egui::pos2(left + badge_width + 6.0, block_top),
+		name,
+		name_color,
+	);
 
 	if response.clicked() {
 		state.selected = host.id;

@@ -247,13 +247,7 @@ impl SessionManager {
 		display: daisy_core::model::DisplaySettings,
 		expected_cert: Option<String>,
 	) {
-		let view = RdpView::new(
-			title.clone(),
-			params,
-			host_id,
-			display,
-			expected_cert,
-		);
+		let view = RdpView::new(title.clone(), params, host_id, display, expected_cert);
 		self.push(title, TabState::Live(TabContent::Rdp(Box::new(view))), None);
 	}
 

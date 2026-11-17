@@ -113,8 +113,7 @@ mod imp {
 			let change_count: i64 = unsafe { msg_send![pasteboard, changeCount] };
 
 			// 只认 NSURL 这一类型的对象；options 传 nil
-			let classes: Id =
-				unsafe { msg_send![class!(NSArray), arrayWithObject: class!(NSURL)] };
+			let classes: Id = unsafe { msg_send![class!(NSArray), arrayWithObject: class!(NSURL)] };
 			let objects: Id = unsafe {
 				msg_send![pasteboard,
 					readObjectsForClasses: classes,

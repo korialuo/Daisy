@@ -737,21 +737,14 @@ fn parse_script(spec: &str) -> Result<Vec<Step>, String> {
 			if parts.len() != 4 && parts.len() != 5 {
 				return Err(bad());
 			}
-			let n = |i: usize| -> Result<u16, String> {
-				parts[i].parse::<u16>().map_err(|_| bad())
-			};
+			let n =
+				|i: usize| -> Result<u16, String> { parts[i].parse::<u16>().map_err(|_| bad()) };
 			let steps_count = if parts.len() == 5 {
 				parts[4].parse::<u16>().map_err(|_| bad())?
 			} else {
 				12
 			};
-			steps.push(Step::Drag(
-				n(0)?,
-				n(1)?,
-				n(2)?,
-				n(3)?,
-				steps_count.max(1),
-			));
+			steps.push(Step::Drag(n(0)?, n(1)?, n(2)?, n(3)?, steps_count.max(1)));
 		} else if let Some(text) = step.strip_prefix("type:") {
 			// 只保证 US 布局的 ASCII：非 ASCII 要么发不出去，要么在远端变成别的字，
 			// 与其静默出错不如在解析阶段就拦下
@@ -1017,7 +1010,10 @@ impl RdpView {
 					.filter(|part| !part.is_empty())
 					.map(std::path::PathBuf::from)
 					.collect();
-				(paths, Some(std::time::Instant::now() + SMOKE_CLIP_FILES_DELAY))
+				(
+					paths,
+					Some(std::time::Instant::now() + SMOKE_CLIP_FILES_DELAY),
+				)
 			}),
 			smoke_paste_at: std::env::var(SMOKE_PASTE_ENV)
 				.ok()
@@ -1417,7 +1413,11 @@ impl RdpView {
 
 			// 独立窗口 / 全屏：与「画面怎么显示」同类，放在这一行末尾
 			ui.add_space(design::GAP_MD);
-			let detach_label = if self.detached { "收回标签页" } else { "独立窗口" };
+			let detach_label = if self.detached {
+				"收回标签页"
+			} else {
+				"独立窗口"
+			};
 			if design::chip(ui, detach_label, self.detached).clicked() {
 				if self.detached {
 					self.detach_back();
@@ -1426,7 +1426,11 @@ impl RdpView {
 				}
 			}
 			if self.detached {
-				let fullscreen_label = if self.detached_fullscreen { "退出全屏" } else { "全屏" };
+				let fullscreen_label = if self.detached_fullscreen {
+					"退出全屏"
+				} else {
+					"全屏"
+				};
 				if design::chip(ui, fullscreen_label, self.detached_fullscreen).clicked() {
 					self.detached_fullscreen = !self.detached_fullscreen;
 				}
@@ -1502,9 +1506,8 @@ impl RdpView {
 						}
 					});
 
-				ui.weak("缩放").on_hover_text(
-					"内容放大倍数：远端按 1/倍数 渲染，本机放大显示（100% 为原样）",
-				);
+				ui.weak("缩放")
+					.on_hover_text("内容放大倍数：远端按 1/倍数 渲染，本机放大显示（100% 为原样）");
 				let dpi_label = format!("{}%", self.dpi);
 				egui::ComboBox::from_id_salt("rdp-dpi")
 					.selected_text(dpi_label)
@@ -1796,10 +1799,7 @@ impl RdpView {
 					Ok(path) => saved.push(path),
 					Err(error) => {
 						failed += 1;
-						tracing::warn!(
-							"[剪贴板] 远端文件落盘失败「{}」：{error}",
-							file.name
-						);
+						tracing::warn!("[剪贴板] 远端文件落盘失败「{}」：{error}", file.name);
 					},
 				}
 			}
@@ -1879,7 +1879,10 @@ impl RdpView {
 			// 否则下一轮又只能靠猜（这次就是这么耗掉一整轮）。
 			let detail = match self.session.clipboard_last_server_message() {
 				Some((kind, ago)) => {
-					format!("最近一条远端报文是「{kind}」，{:.1} 秒前", ago.as_secs_f32())
+					format!(
+						"最近一条远端报文是「{kind}」，{:.1} 秒前",
+						ago.as_secs_f32()
+					)
 				},
 				None => "本会话没收到过任何远端报文".to_string(),
 			};
@@ -2027,8 +2030,7 @@ impl RdpView {
 				// **刚上报过就别再报一遍**：真机对照实测，粘贴时重复
 				// 上报同一批文件，rdpclip 会变成「反复索要描述表、
 				// 一次不问大小」，文件永远不落盘；只注入 Ctrl+V 则正常。
-				let already_announced = self.last_files_change_count
-					== Some(files.change_count)
+				let already_announced = self.last_files_change_count == Some(files.change_count)
 					&& self
 						.last_files_announced_at
 						.is_some_and(|at| at.elapsed() < PASTE_REANNOUNCE_WINDOW);
@@ -2058,7 +2060,8 @@ impl RdpView {
 	}
 
 	/// 补发 Ctrl+C / Ctrl+X 到远端（S8-63）。
-	fn send_copy_to_remote(&mut self, cut: bool) {		let letter = if cut { RdpKey::X } else { RdpKey::C };
+	fn send_copy_to_remote(&mut self, cut: bool) {
+		let letter = if cut { RdpKey::X } else { RdpKey::C };
 		// Ctrl 必须**按住到底**，且按键之间不能连发——
 		// `send_input` 是同步写通道的，四条连着发会被远端当成同一批，
 		// Ctrl 被丢掉、远端只看到字母本身（粘贴路径已修，这里同理）。
@@ -2285,7 +2288,8 @@ impl RdpView {
 				tracing::info!(
 					"无人值守输入脚本：从 ({x1}, {y1}) 拖到 ({x2}, {y2})，共 {steps_count} 段"
 				);
-				self.session.send_input(InputEvent::PointerMove { x: x1, y: y1 });
+				self.session
+					.send_input(InputEvent::PointerMove { x: x1, y: y1 });
 				self.session.send_input(InputEvent::PointerButton {
 					button: RdpPointerButton::Left,
 					down: true,
@@ -2747,8 +2751,7 @@ impl RdpView {
 					// 「什么都没发生」。这里补记意图，让它和 Cmd+C 一样能被提示。
 					let physical = physical_key.unwrap_or(key);
 					if pressed
-						&& !repeat
-						&& (modifiers.ctrl || modifiers.command)
+						&& !repeat && (modifiers.ctrl || modifiers.command)
 						&& matches!(physical, egui::Key::C | egui::Key::X)
 					{
 						self.user_tried_remote_copy = true;
@@ -3002,9 +3005,7 @@ fn collect_local_files(paths: &[std::path::PathBuf]) -> Vec<daisy_rdp::LocalFile
 ///
 /// 只有「根本没读到任何文件对象」时才允许报文本，这样复制纯文本
 /// 仍然照旧（`readObjectsForClasses:@[NSURL]` 返回空数组的情形）。
-fn text_branch_allowed(
-	files: &Option<crate::pasteboard_files::ClipboardFiles>,
-) -> bool {
+fn text_branch_allowed(files: &Option<crate::pasteboard_files::ClipboardFiles>) -> bool {
 	match files {
 		Some(files) => files.paths.is_empty() && files.skipped == 0,
 		None => true,
@@ -4479,10 +4480,10 @@ mod file_clipboard_tests {
 	#[test]
 	fn identical_content_reuses_the_original_name() {
 		let dir = tempfile::tempdir().expect("临时目录");
-		let first = super::save_into(dir.path(), "hosts", b"127.0.0.1 localhost\n")
-			.expect("首次落盘");
-		let again = super::save_into(dir.path(), "hosts", b"127.0.0.1 localhost\n")
-			.expect("再次落盘");
+		let first =
+			super::save_into(dir.path(), "hosts", b"127.0.0.1 localhost\n").expect("首次落盘");
+		let again =
+			super::save_into(dir.path(), "hosts", b"127.0.0.1 localhost\n").expect("再次落盘");
 
 		assert_eq!(again, first, "内容一样就该复用同一个文件");
 		let count = std::fs::read_dir(dir.path()).unwrap().count();
@@ -4497,7 +4498,10 @@ mod file_clipboard_tests {
 	#[test]
 	fn arm_only_when_nothing_transferable() {
 		assert!(super::should_arm(false, false), "本地没有可传内容必须开嗓");
-		assert!(!super::should_arm(true, false), "真有文件要传时不能补空文本");
+		assert!(
+			!super::should_arm(true, false),
+			"真有文件要传时不能补空文本"
+		);
 		assert!(!super::should_arm(false, true), "本轮已上报过就别再补");
 	}
 
@@ -4524,7 +4528,10 @@ mod file_clipboard_tests {
 	/// 刚复制的文件悄悄清掉。
 	#[test]
 	fn control_only_remote_text_is_not_synced() {
-		assert!(!super::worth_syncing("\u{3}"), "CF_LOCALE 残渣不能落进剪贴板");
+		assert!(
+			!super::worth_syncing("\u{3}"),
+			"CF_LOCALE 残渣不能落进剪贴板"
+		);
 		assert!(!super::worth_syncing(""));
 		assert!(!super::worth_syncing(" \r\n\t"));
 		assert!(super::worth_syncing("b.txt"), "正常文本照旧同步");
@@ -4616,10 +4623,7 @@ mod file_clipboard_tests {
 			paths: Vec::new(),
 			skipped: 1,
 		});
-		assert!(
-			!text_branch_allowed(&folder_only),
-			"复制文件夹时不许报文本"
-		);
+		assert!(!text_branch_allowed(&folder_only), "复制文件夹时不许报文本");
 
 		// 纯文本剪贴板（没读到任何文件对象）照旧
 		assert!(text_branch_allowed(&None), "纯文本剪贴板必须仍然上报");

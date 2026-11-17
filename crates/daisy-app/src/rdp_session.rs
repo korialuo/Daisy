@@ -51,7 +51,8 @@ enum PasteContent {
 }
 
 /// 发往 RDP 线程的指令。
-enum Command {	/// 主动断开（界面关标签页或退出）。
+enum Command {
+	/// 主动断开（界面关标签页或退出）。
 	Disconnect,
 	/// 注入一次键鼠输入。
 	Input(InputEvent),
@@ -593,7 +594,9 @@ fn run(
 							waited += PASTE_POLL_MS;
 						}
 						if client.clipboard_format_list_acked() {
-							tracing::info!("[剪贴板] 远端已确认格式列表（{waited}ms），注入 Ctrl+V");
+							tracing::info!(
+								"[剪贴板] 远端已确认格式列表（{waited}ms），注入 Ctrl+V"
+							);
 						} else {
 							tracing::warn!(
 								"[剪贴板] {ACK_WAIT_MAX_MS}ms 内远端未确认格式列表，仍注入 Ctrl+V"

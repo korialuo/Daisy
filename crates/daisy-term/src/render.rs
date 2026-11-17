@@ -234,14 +234,7 @@ impl TerminalRenderer {
 	/// 而中文字形只有 1em 宽（约 1.6 格），终端却按两格记账——差出来的
 	/// 那点距离会累积到同段后面每一个字符上，一行里汉字越多后面越左移。
 	/// 单独画之后每个宽字符都从自己的格子起算，后面紧跟的窄段不受影响。
-	fn paint_wide(
-		&self,
-		painter: &Painter,
-		cell: Pos2,
-		ch: char,
-		font: &FontId,
-		fg: Color32,
-	) {
+	fn paint_wide(&self, painter: &Painter, cell: Pos2, ch: char, font: &FontId, fg: Color32) {
 		if ch == ' ' {
 			return;
 		}
