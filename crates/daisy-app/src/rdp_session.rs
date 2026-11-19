@@ -446,13 +446,43 @@ impl RdpSession {
 	}
 }
 
+/// 关闭时最多等会话线程多久。
+///
+/// 这里必须**有上限**：`disconnect()` 只是往队列里塞一条命令（合作式），
+/// 会话线程若正卡在 `Command::Paste` 的等回执/注入/验证（累计可达 4 秒）
+/// 或阻塞式 `freerdp_disconnect`，无超时 `join()` 会把 UI 主线程一起拖死——
+/// 真机表现就是「点关闭后窗口标题变成『未响应』」。超过这个时限就放弃
+/// join：会话线程结束时会自己在它自己的线程里释放 FreeRDP 上下文， Arc
+/// 也会保住共享状态，不会 use-after-free，只是这次不再同步等待它。
+const CLOSE_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 impl Drop for RdpSession {
 	fn drop(&mut self) {
 		self.disconnect();
-		// 等线程退出：FreeRDP 上下文必须在创建它的线程里释放
-		if let Some(join) = self.join.take() {
+		let Some(join) = self.join.take() else {
+			return;
+		};
+		// 先给一个短暂的同步窗口：绝大多数情况下会话线程下一轮泵就退出了，
+		// join 立刻返回，FreeRDP 上下文仍保证在正确的线程里释放。
+		std::thread::sleep(std::time::Duration::from_millis(20));
+		if join.is_finished() {
 			let _ = join.join();
+			return;
 		}
+		// 没退就限时轮询，别在 UI 线程上死等。
+		let deadline = std::time::Instant::now() + CLOSE_JOIN_TIMEOUT;
+		while std::time::Instant::now() < deadline {
+			std::thread::sleep(std::time::Duration::from_millis(25));
+			if join.is_finished() {
+				let _ = join.join();
+				return;
+			}
+		}
+		// 超时：放弃 join（detach）。线程会在自己退出时释放上下文与 Arc。
+		tracing::warn!(
+			"关闭 RDP 会话：等待 {CLOSE_JOIN_TIMEOUT:?} 后会话线程仍未退出，放弃同步等待以免窗口无响应"
+		);
+		drop(join);
 	}
 }
 

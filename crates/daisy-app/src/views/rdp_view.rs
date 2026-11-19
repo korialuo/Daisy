@@ -3048,11 +3048,32 @@ fn should_arm(has_transferable_files: bool, announced_now: bool) -> bool {
 /// 用户在 Finder 里 Cmd+V 仍然是把这份文件**复制**到他选定的目录，
 /// 文件名保持远端原名。
 fn staging_root() -> std::path::PathBuf {
-	let home = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-	home.join("Library")
-		.join("Caches")
-		.join("Daisy")
-		.join("clipboard")
+	// 平台各自的「应用缓存」目录——不能硬编码 macOS 的 ~/Library/Caches：
+	// Windows 上那会拼出 `C:\Users\x\Library\Caches\...` 这种非标准路径，
+	// 既不在系统缓存里、也可能因权限/策略写不进去，落盘失败就红字。
+	#[cfg(target_os = "macos")]
+	{
+		let home = std::env::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+		home.join("Library")
+			.join("Caches")
+			.join("Daisy")
+			.join("clipboard")
+	}
+	#[cfg(target_os = "windows")]
+	{
+		// %LOCALAPPDATA%\Daisy\clipboard（本地缓存，不漫游、不进「下载」）。
+		// 拿不到环境变量时退回系统临时目录，绝不用当前目录污染工作区。
+		std::env::var_os("LOCALAPPDATA")
+			.map(std::path::PathBuf::from)
+			.or_else(|| std::env::temp_dir().parent().map(std::path::PathBuf::from))
+			.unwrap_or_else(std::env::temp_dir)
+			.join("Daisy")
+			.join("clipboard")
+	}
+	#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+	{
+		std::env::temp_dir().join("Daisy").join("clipboard")
+	}
 }
 
 /// 清掉中转目录里的旧批次。

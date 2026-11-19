@@ -280,15 +280,33 @@ mod imp {
 		unsafe { GetClipboardSequenceNumber() as i64 }
 	}
 
+	/// 打开剪贴板，短暂重试。
+	///
+	/// RDP 会话里 `rdpclip.exe`、资源管理器、浏览器都可能正持有剪贴板；
+	/// 单次 `OpenClipboard` 失败太常见——这正是「远端文件已下载、挂剪贴板
+	/// 却报红字」的高频原因。给约 400ms 的重试窗口，绝大多数竞争都能等过去。
+	/// 成功时调用方**必须**配对 `CloseClipboard()`。
+	fn open_clipboard() -> bool {
+		for attempt in 0..8 {
+			// SAFETY: 空 HWND 表示当前线程 owned；主线程调用。
+			if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+				return true;
+			}
+			if attempt < 7 {
+				std::thread::sleep(std::time::Duration::from_millis(50));
+			}
+		}
+		false
+	}
+
 	/// 资源管理器里「复制文件」落的是 `CF_HDROP`；`DragQueryFileW` 是唯一
 	/// 能把它展开成路径列表的 API（传 `0xFFFFFFFF` 先问条数）。
 	///
 	/// # Safety
 	/// 调用线程最好是主线程（剪贴板 API 本身不要求，但 COM 化的格式要求 STA）。
 	pub unsafe fn read_files() -> Option<super::ClipboardFiles> {
-		// SAFETY: 空 HWND 表示当前线程 owned；主线程调用。
-		if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
-			tracing::debug!("[剪贴板] OpenClipboard 失败（读），跳过");
+		if !open_clipboard() {
+			tracing::debug!("[剪贴板] OpenClipboard 失败（读，含重试），跳过");
 			return None;
 		}
 		// 任何提前 return 都必须关掉剪贴板，否则别的程序全粘不了。
@@ -402,20 +420,23 @@ mod imp {
 		// SAFETY: 与上面的 GlobalLock 配对。
 		unsafe { GlobalUnlock(global) };
 
-		// SAFETY: 主线程；失败时要自己释放句柄（成功则系统接管）。
-		if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+		// 先把剪贴板打开（带重试）再清空——OpenClipboard 失败时绝不碰
+		// EmptyClipboard，否则会把用户原有剪贴板清掉却什么都没挂上。
+		if !open_clipboard() {
 			unsafe { GlobalFree(global) };
-			tracing::warn!("[剪贴板] OpenClipboard 失败（写）");
+			tracing::warn!("[剪贴板] OpenClipboard 失败（写，含重试），未改动用户剪贴板");
 			return None;
 		}
 		let result = (|| {
 			// SAFETY: 打开剪贴板后才能清空。
 			if unsafe { EmptyClipboard() } == 0 {
+				tracing::warn!("[剪贴板] EmptyClipboard 失败（写）");
 				return None;
 			}
 			// SAFETY: global 里是完整的 CF_HDROP 数据；成功后所有权转给系统。
 			let set: HANDLE = unsafe { SetClipboardData(CF_HDROP as u32, global) };
 			if set.is_null() {
+				tracing::warn!("[剪贴板] SetClipboardData(CF_HDROP) 失败（写）");
 				return None;
 			}
 			Some(sequence())
@@ -552,12 +573,12 @@ mod tests {
 		std::fs::write(&a, b"a").unwrap();
 		std::fs::write(&b, b"b").unwrap();
 
-		// 写
-		let change_count = put_files(&[a.clone(), b.clone()]);
-		if change_count.is_none() {
-			// 剪贴板不可用（无头 CI）——不强求
-			return;
-		}
+		// 写。**写失败必须让测试失败**：以前这里 `return`，于是写路径整个
+		// 坏掉（Windows 分支曾长期是空实现）测试照样 passed——假阳性掩盖了
+		// 回归。这是 `#[ignore]` 的手动真机测试，就该如实报告写没写进去。
+		put_files(&[a.clone(), b.clone()]).expect(
+			"put_files 写系统剪贴板失败——文件粘贴会红字，检查日志里的 OpenClipboard/SetClipboardData",
+		);
 
 		// 读
 		let read = clipboard_files().expect("刚写完应能读回");
