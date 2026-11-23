@@ -592,6 +592,16 @@ pub struct RdpView {
 	/// 这次写入自己也会让轮询看到一份「新的」文件列表——
 	/// 用序号认出是自己写的，不往远端回推，否则乒乓。
 	pushed_file_change_count: Option<i64>,
+	/// 刚写进本地剪贴板的那批文件的**路径集合**（按路径判重的兜底）。
+	///
+	/// Windows 上 `GetClipboardSequenceNumber` 是系统全局序号，rdpclip 在
+	/// RDP 会话里持续同步剪贴板会让它频繁变化——光靠序号判重会在几十
+	/// 毫秒内失效，于是「刚从远端下载的文件」被当成「本地新复制」回推
+	/// 远端，形成乒乓、剪贴板状态错乱（真机 2026-11-23：02:37:08 挂上
+	/// 本地剪贴板，02:37:33 又被回推远端）。macOS 的 `changeCount` 是
+	/// 应用级、稳定得多，所以只有 Windows 暴露这个差异。
+	/// 路径集合相同就认定是自己写的，与序号判重取「或」。
+	pushed_file_paths: Option<Vec<std::path::PathBuf>>,
 	/// 上次轮询本地剪贴板的时刻（系统没有变更事件，只能定时看）。
 	last_clip_poll: std::time::Instant,
 	/// 是否已提示过「远端 → 本地不可用」（每条会话只提示一次）。
@@ -996,6 +1006,7 @@ impl RdpView {
 			last_files_change_count: None,
 			last_files_announced_at: None,
 			pushed_file_change_count: None,
+			pushed_file_paths: None,
 			last_clip_poll: std::time::Instant::now(),
 			warned_no_remote_clip: false,
 			pixels_per_point: 1.0,
@@ -1376,6 +1387,8 @@ impl RdpView {
 		self.warned_no_remote_clip = false;
 		self.user_tried_remote_copy = false;
 		self.copy_attempt_at = None;
+		self.pushed_file_change_count = None;
+		self.pushed_file_paths = None;
 	}
 
 	/// 缩放工具栏。改动先落到本视图（立刻有视觉反馈），再上报给应用层落库。
@@ -1814,6 +1827,9 @@ impl RdpView {
 				let clipped =
 					crate::pasteboard_files::put_files(&saved).is_some_and(|change_count| {
 						self.pushed_file_change_count = Some(change_count);
+						// 同时记路径集合：Windows 全局序号判重会被 rdpclip 的
+						// 持续同步冲掉，靠路径认出「这批是我刚写的」才稳。
+						self.pushed_file_paths = Some(saved.clone());
 						true
 					});
 				let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
@@ -1937,8 +1953,16 @@ impl RdpView {
 					// 同一个 changeCount 已经报过也不再重复。用序号而不是
 					// 路径比对：用户对同一批文件再按一次 Cmd+C 会拿到新的
 					// 序号，理应重新上报（上次可能远端没收到）。
+					// 判「是不是刚从远端下载、由我们自己挂上剪贴板的」：
+					// 序号相同 OR 路径集合相同都算自己人。Windows 的全局序号
+					// 会被 rdpclip 的同步冲掉，必须靠路径兜底，否则刚下载的
+					// 文件又被回推远端，乒乓到剪贴板错乱（真机 2026-11-23）。
+					let same_paths = self.pushed_file_paths.as_ref().is_some_and(|pushed| {
+						pushed.len() == files.paths.len()
+							&& pushed.iter().all(|p| files.paths.contains(p))
+					});
 					if self.pushed_file_change_count != Some(files.change_count)
-						&& self.last_files_change_count != Some(files.change_count)
+						&& !same_paths && self.last_files_change_count != Some(files.change_count)
 					{
 						if has_transferable {
 							tracing::info!(

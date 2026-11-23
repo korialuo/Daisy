@@ -349,15 +349,40 @@ impl PtySession {
 	}
 }
 
+/// 关闭时最多等 PTY 读线程多久。
+///
+/// `read_loop` 阻塞在 `reader.read()`（同步读，无超时）。关窗口时 `Drop`
+/// 先 `child.kill()`，但 ConPTY/Unix PTY 的 master 句柄不会立刻让 `read()`
+/// 返回——实测会卡住；而这个 `join()` 跑在 UI 主线程，于是整个窗口
+/// 标题栏变成「未响应」。每次启动都有一个本地终端标签页，所以关窗口
+/// **必然**走到这里。给等待加上限：超时就放弃 join，读线程会在 master
+/// 句柄最终关闭时自己退出，Arc/Waker 都由它自己持有，不会 use-after-free。
+const READER_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 impl Drop for PtySession {
 	fn drop(&mut self) {
 		// 子进程还活着就收掉，否则会残留成孤儿进程
 		if self.exit_code.is_none() {
 			let _ = self.child.kill();
 		}
-		// 读取线程会因为 master 句柄关闭而自然退出
+		// 读取线程会因为 master 句柄关闭而自然退出——但不能在 UI 主线程
+		// 无超时地等它（见 READER_JOIN_TIMEOUT）。
 		if let Some(handle) = self.reader_thread.take() {
-			let _ = handle.join();
+			std::thread::sleep(std::time::Duration::from_millis(10));
+			if handle.is_finished() {
+				let _ = handle.join();
+				return;
+			}
+			let deadline = std::time::Instant::now() + READER_JOIN_TIMEOUT;
+			while std::time::Instant::now() < deadline {
+				std::thread::sleep(std::time::Duration::from_millis(20));
+				if handle.is_finished() {
+					let _ = handle.join();
+					return;
+				}
+			}
+			tracing::debug!("PTY 读线程 {READER_JOIN_TIMEOUT:?} 未退出，放弃等待以免关闭窗口卡死");
+			drop(handle);
 		}
 	}
 }

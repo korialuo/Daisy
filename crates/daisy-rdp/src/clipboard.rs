@@ -163,6 +163,14 @@ const FILECONTENTS_RANGE: u32 = 0x0000_0002;
 /// 256KB 留足余量，也避免单块在慢链路上占太久。
 const FILE_CHUNK_SIZE: u32 = 256 * 1024;
 
+/// 单个文件块请求多久没响应就算卡住。
+///
+/// 正常一块 256KB 在局域网里几十毫秒；8 秒远大于任何合理往返，
+/// 又能让「服务端彻底不回」的故障在用户察觉前报出来。
+const FILE_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// 卡住的块最多重发几次。偶发丢一次能救回，持续不回就明确失败。
+const FILE_REQUEST_MAX_RETRIES: u8 = 3;
+
 /// 内存拼装的单文件上限。超过直接判失败——流式落盘要等真实需求。
 pub const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 
@@ -276,6 +284,10 @@ struct Download {
 	completed: Vec<RemoteFile>,
 	/// 已发出、等响应的那个请求。
 	outstanding: Option<FileRequest>,
+	/// `outstanding` 发出的时刻——用于检测服务端不再回应（见 `retry_if_stalled`）。
+	outstanding_at: Option<std::time::Instant>,
+	/// 当前 `outstanding` 已重试几次。
+	retries: u8,
 	/// 待发请求（回调只记账，帧循环 [`Clipboard::flush_outgoing`] 发）。
 	next_request: Option<FileRequest>,
 	/// 下一个 streamId。
@@ -308,6 +320,8 @@ impl Download {
 			buffer: Vec::new(),
 			completed: Vec::new(),
 			outstanding: None,
+			outstanding_at: None,
+			retries: 0,
 			next_request: None,
 			next_stream_id: 1,
 			clip_data_id,
@@ -402,7 +416,47 @@ impl Download {
 	fn pop_request(&mut self) -> Option<FileRequest> {
 		let request = self.next_request.take()?;
 		self.outstanding = Some(request);
+		self.outstanding_at = Some(std::time::Instant::now());
+		self.retries = 0;
 		Some(request)
+	}
+
+	/// 检测「发出去的文件请求石沉大海」。
+	///
+	/// 真机（管理机 Win10，2026-11-23）：下载 40MB 时服务端在某一块之后
+	/// 不再回 `FileContentsResponse`，客户端却一直挂在 `outstanding` 上，
+	/// 既不再发下一块、也不报错——界面停在下载中途，用户只看到红字误报。
+	/// 这里给每块一个超时：先重发同一请求（服务端偶发丢包能救回来），
+	/// 重发若干次仍无响应就明确失败，让上层报出正确的错误文案。
+	fn retry_if_stalled(&mut self) -> Option<FileRequest> {
+		if self.failed.is_some() || self.finished {
+			return None;
+		}
+		let elapsed = self
+			.outstanding_at
+			.map(|at| at.elapsed())
+			.unwrap_or_default();
+		if elapsed < FILE_REQUEST_TIMEOUT {
+			return None;
+		}
+		let outstanding = self.outstanding?;
+		if self.retries >= FILE_REQUEST_MAX_RETRIES {
+			self.failed = Some(format!(
+				"下载「{}」超时：第 {} 块请求 {} 次后服务端仍无响应",
+				self.entries[self.index].name, self.index, self.retries
+			));
+			self.outstanding_at = None;
+			return None;
+		}
+		self.retries += 1;
+		self.outstanding_at = Some(std::time::Instant::now());
+		tracing::warn!(
+			"[剪贴板] 文件块请求超时，重发第 {} 次（streamId={} pos={}）",
+			self.retries,
+			outstanding.stream_id,
+			outstanding.position
+		);
+		Some(outstanding)
 	}
 
 	/// 服务端的一块响应。`ok` 为假（`CB_RESPONSE_FAIL`）或流号对不上时终止。
@@ -418,6 +472,8 @@ impl Download {
 			return;
 		}
 		self.outstanding = None;
+		self.outstanding_at = None;
+		self.retries = 0;
 		if !ok {
 			// 失败响应可能带 4 字节错误码（Win32/HRESULT）；打出来才知道
 			// 服务端为什么拒绝，否则只剩一句「被拒绝」无从下手。
@@ -829,7 +885,15 @@ impl Clipboard {
 					download.lock_sent = true;
 				}
 			}
-			let request = self.lock().download.as_mut().and_then(|d| d.pop_request());
+			// 先看有没有卡住的块要重发；没有才发下一个新请求。
+			// 两个都要在发之前算好：outstanding 只有一条，不能同时发。
+			let stalled = self
+				.lock()
+				.download
+				.as_mut()
+				.and_then(|d| d.retry_if_stalled());
+			let request =
+				stalled.or_else(|| self.lock().download.as_mut().and_then(|d| d.pop_request()));
 			if let Some(request) = request {
 				let rc = send_file_contents_request(context, &request);
 				tracing::info!(
