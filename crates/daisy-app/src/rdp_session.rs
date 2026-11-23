@@ -496,23 +496,31 @@ const CLOSE_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 
 impl Drop for RdpSession {
 	fn drop(&mut self) {
+		tracing::info!("[关闭] RdpSession::drop 开始（发断开）");
 		self.disconnect();
 		// **先掐断按需读取**：延迟渲染下 OLE/AppKit 线程可能正挂在
 		// `read_chunk` 的 recv_timeout 上，会话线程若卡在 freerdp_disconnect
 		// 就永远没人来喂数据——那是 15s 级别的 UI 卡死（Windows 会弹
 		// 「未响应」）。这里立刻让所有等待者失败、并让后续读取秒失败。
-		self.clipboard.invalidate_remote_content();
+		self.clipboard
+			.invalidate_remote_content_within(std::time::Duration::from_millis(200));
+		tracing::info!("[关闭] 剪贴板内容已失效");
 		// Windows：把我们挂在系统剪贴板上的延迟渲染对象撤掉。留着的话
 		// OLE 会在进程/会话收尾时向已断开的会话索要文件字节。
 		#[cfg(target_os = "windows")]
-		crate::deferred_clipboard_win::clear_deferred();
+		{
+			crate::deferred_clipboard_win::clear_deferred();
+			tracing::info!("[关闭] 延迟渲染剪贴板处理完毕");
+		}
 		let Some(join) = self.join.take() else {
+			tracing::info!("[关闭] 没有 join 句柄，直接返回");
 			return;
 		};
 		// 先给一个短暂的同步窗口：绝大多数情况下会话线程下一轮泵就退出了，
 		// join 立刻返回，FreeRDP 上下文仍保证在正确的线程里释放。
 		std::thread::sleep(std::time::Duration::from_millis(20));
 		if join.is_finished() {
+			tracing::info!("[关闭] 会话线程已退出，同步 join");
 			let _ = join.join();
 			return;
 		}
@@ -521,6 +529,7 @@ impl Drop for RdpSession {
 		while std::time::Instant::now() < deadline {
 			std::thread::sleep(std::time::Duration::from_millis(25));
 			if join.is_finished() {
+				tracing::info!("[关闭] 会话线程在限时内退出");
 				let _ = join.join();
 				return;
 			}

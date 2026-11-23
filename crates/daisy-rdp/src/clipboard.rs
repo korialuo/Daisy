@@ -879,6 +879,56 @@ impl Clipboard {
 		self.fail_all_chunk_readers("会话已断开，远端文件内容不再可用");
 	}
 
+	/// 关闭路径专用：最多等 `timeout` 拿锁，拿不到就放弃。
+	///
+	/// 会话线程可能正持锁在 `flush_outgoing` 的 FFI 调用里（socket 卡住时
+	/// 能顶很久），而这段代码跑在 **UI 主线程的 Drop** 上——用普通 `lock()`
+	/// 就会把窗口拖成「未响应」。这里宁可漏掉一次清理（进程马上要退，
+	/// 本来也会释放）也不能阻塞关闭。
+	pub fn invalidate_remote_content_within(&self, timeout: std::time::Duration) {
+		let deadline = std::time::Instant::now() + timeout;
+		loop {
+			match self.state.try_lock() {
+				Ok(mut state) => {
+					state.remote_manifest = None;
+					state.manifest_clip_data_id = None;
+					state.manifest_lock_sent = false;
+					state.remote_files = None;
+					state.download = None;
+					// 队列里的等待者就地失败，不必再拿一次锁
+					for reader in state.chunk_readers.drain(..) {
+						let _ = reader
+							.reply
+							.send(Err("会话已断开，远端文件内容不再可用".to_string()));
+					}
+					return;
+				},
+				Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+					let mut state = poisoned.into_inner();
+					state.remote_manifest = None;
+					state.manifest_clip_data_id = None;
+					state.remote_files = None;
+					state.download = None;
+					for reader in state.chunk_readers.drain(..) {
+						let _ = reader
+							.reply
+							.send(Err("会话已断开，远端文件内容不再可用".to_string()));
+					}
+					return;
+				},
+				Err(std::sync::TryLockError::WouldBlock) => {
+					if std::time::Instant::now() >= deadline {
+						tracing::warn!(
+							"[关闭] 剪贴板锁被占用，放弃清理以免拖住关闭（{timeout:?} 超时）"
+						);
+						return;
+					}
+					std::thread::sleep(std::time::Duration::from_millis(5));
+				},
+			}
+		}
+	}
+
 	pub fn deferred_mode(&self) -> bool {
 		self.lock().deferred_mode
 	}

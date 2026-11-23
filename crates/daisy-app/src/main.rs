@@ -518,9 +518,6 @@ struct DaisyApp {
 	store_error: Option<String>,
 	/// 数据目录。配置、数据库与日志都在它下面。
 	paths: AppPaths,
-	/// 日志句柄。持有写盘守卫与级别热替换句柄，必须活到进程结束。
-	/// 初始化失败时为 `None`——日志不可用不该挡住主功能。
-	logging: Option<Logging>,
 	/// 当前配置（设置窗口直接改它）。
 	config: AppConfig,
 	/// 已落盘并生效的配置。每帧与 `config` 比对，不同就应用+保存。
@@ -593,6 +590,14 @@ struct DaisyApp {
 	smoke_fonts: Vec<(Instant, Option<String>)>,
 	/// 有一批单元格尺寸要等新字体生效之后再量（见 [`Self::apply_config`]）。
 	appearance_pending: bool,
+	/// 日志句柄。持有写盘守卫与级别热替换句柄。
+	///
+	/// **必须声明在结构体最后**：Rust 的字段 drop 顺序＝声明顺序，而关闭
+	/// 过程（各标签页、RDP/PTY 线程收尾）恰恰是最需要日志的时刻。放在
+	/// `sessions` 之前会让写盘守卫先 drop，那段日志全部丢掉——排查「关窗口
+	/// 卡死」时就完全看不到卡在哪一步。初始化失败时为 `None`：日志不可用
+	/// 不该挡住主功能。
+	logging: Option<Logging>,
 }
 
 impl DaisyApp {
