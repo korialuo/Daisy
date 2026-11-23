@@ -27,7 +27,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::{OleInitialize, OleSetClipboard};
+use windows::Win32::System::Ole::{OleInitialize, OleIsCurrentClipboard, OleSetClipboard};
 use windows::Win32::UI::Shell::FILEDESCRIPTORW;
 use windows::core::{ComObject, ComObjectInner, HRESULT, Ref, implement, w};
 
@@ -437,6 +437,39 @@ impl IDataObject_Impl for DeferredDataObject_Impl {
 	}
 }
 
+thread_local! {
+	/// 我们最近一次挂上去的对象。撤下前要用 `OleIsCurrentClipboard` 确认
+	/// 剪贴板里仍是它——用户后来复制了别的东西时，无条件清空会把用户的
+	/// 剪贴板抹掉。
+	static CURRENT_OBJECT: std::cell::RefCell<Option<IDataObject>> =
+		const { std::cell::RefCell::new(None) };
+}
+
+/// 撤掉我们自己挂的延迟渲染剪贴板。
+///
+/// 会话断开/退出时必须调用：否则 OLE 仍持有 `IDataObject`，系统做剪贴板
+/// flush 时会挨个找我们要 `CFSTR_FILECONTENTS`，而字节已经拉不到了——
+/// 表现就是关窗口卡在「未响应」。清掉后剪贴板退回系统默认（与 mstsc 退出
+/// 后远端文件失效的行为一致）。
+pub fn clear_deferred() {
+	let still_ours = CURRENT_OBJECT.with(|slot| {
+		let slot = slot.borrow();
+		match slot.as_ref() {
+			// SAFETY: 与 install_deferred 同线程（UI 主线程），OLE 已初始化。
+			Some(object) => unsafe { OleIsCurrentClipboard(object).is_ok() },
+			None => false,
+		}
+	});
+	if still_ours {
+		// SAFETY: 同上。
+		unsafe {
+			let _ = OleSetClipboard(None);
+		}
+		tracing::info!("[剪贴板] 已撤下延迟渲染剪贴板");
+	}
+	CURRENT_OBJECT.with(|slot| *slot.borrow_mut() = None);
+}
+
 /// 把一批远端文件以延迟渲染方式挂上剪贴板。成功后目标程序粘贴时才拉字节。
 /// 必须在 STA 线程（UI 主线程）调用。
 pub fn install_deferred(
@@ -462,5 +495,10 @@ pub fn install_deferred(
 	let com: ComObject<DeferredDataObject> = data_object.into_object();
 	let iface: IDataObject = com.into_interface();
 	// SAFETY: iface 在 OleSetClipboard 成功后由 OLE 持有引用。
-	unsafe { OleSetClipboard(Some(&iface)) }
+	let result = unsafe { OleSetClipboard(Some(&iface)) };
+	if result.is_ok() {
+		// 留一份给 clear_deferred 做归属判断（clone 只 AddRef，不复制数据）。
+		CURRENT_OBJECT.with(|slot| *slot.borrow_mut() = Some(iface));
+	}
+	result
 }

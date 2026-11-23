@@ -497,6 +497,15 @@ const CLOSE_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 impl Drop for RdpSession {
 	fn drop(&mut self) {
 		self.disconnect();
+		// **先掐断按需读取**：延迟渲染下 OLE/AppKit 线程可能正挂在
+		// `read_chunk` 的 recv_timeout 上，会话线程若卡在 freerdp_disconnect
+		// 就永远没人来喂数据——那是 15s 级别的 UI 卡死（Windows 会弹
+		// 「未响应」）。这里立刻让所有等待者失败、并让后续读取秒失败。
+		self.clipboard.invalidate_remote_content();
+		// Windows：把我们挂在系统剪贴板上的延迟渲染对象撤掉。留着的话
+		// OLE 会在进程/会话收尾时向已断开的会话索要文件字节。
+		#[cfg(target_os = "windows")]
+		crate::deferred_clipboard_win::clear_deferred();
 		let Some(join) = self.join.take() else {
 			return;
 		};

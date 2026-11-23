@@ -262,7 +262,7 @@ const CHUNK_STREAM_ID_BASE: u32 = 0x8000_0000;
 
 /// 按需块读取的超时。比全量下载单块略长：COM 线程同步等，宁可多等
 /// 也要给慢链路机会；超时后回错误让目标程序停止粘贴，不能永久挂住。
-const CHUNK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const CHUNK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 待上报的剪贴板内容：文本与文件是**互斥**的两条上报路径，
 /// 格式列表的形态完全不同（文本三种标准格式、文件两种注册格式）。

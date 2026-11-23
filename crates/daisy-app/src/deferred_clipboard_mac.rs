@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use block2::{DynBlock, RcBlock};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, ClassType, DefinedClass, define_class};
+use objc2::{AnyThread, DefinedClass, define_class};
 use objc2_app_kit::{
 	NSFilePromiseProvider, NSFilePromiseProviderDelegate, NSPasteboard, NSPasteboardWriting,
 };
@@ -101,17 +101,14 @@ define_class!(
 
 impl FilePromiseDelegate {
 	fn new_with_state(state: DelegateState) -> Retained<Self> {
-		let this = Self::new_delegate();
-		*this.ivars().state.lock().unwrap() = Some(state);
-		this
-	}
-}
-
-impl FilePromiseDelegate {
-	/// define_class 生成的类没有自动的 `new`，手动发 `+[NSObject new]`。
-	fn new_delegate() -> Retained<Self> {
-		// SAFETY: NSObject 的 new 分配并初始化实例，返回 retained。
-		unsafe { objc2::msg_send![Self::class(), new] }
+		// objc2 的 ivars 是「未初始化」状态，必须用 `set_ivars` 建立，
+		// 直接 `self.ivars()` 赋值会 panic（tried to access uninitialized
+		// instance variable）。之后照常调 NSObject 的 init。
+		let this = Self::alloc().set_ivars(FilePromiseDelegateIvars {
+			state: Mutex::new(Some(state)),
+		});
+		// SAFETY: this 是新分配且 ivars 已初始化的实例。
+		unsafe { objc2::msg_send![super(this), init] }
 	}
 }
 
