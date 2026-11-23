@@ -919,7 +919,7 @@ impl Clipboard {
 				Err(std::sync::TryLockError::WouldBlock) => {
 					if std::time::Instant::now() >= deadline {
 						tracing::warn!(
-							"[关闭] 剪贴板锁被占用，放弃清理以免拖住关闭（{timeout:?} 超时）"
+							"[CLOSE] clipboard lock busy, skipping cleanup after {timeout:?}"
 						);
 						return;
 					}

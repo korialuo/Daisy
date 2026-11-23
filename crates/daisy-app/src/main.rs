@@ -1571,7 +1571,7 @@ impl eframe::App for DaisyApp {
 			static CLOSE_TRACED: std::sync::atomic::AtomicBool =
 				std::sync::atomic::AtomicBool::new(false);
 			if !CLOSE_TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-				tracing::info!("[关闭] egui 收到 close_requested，开始收尾");
+				tracing::info!("[CLOSE] egui close_requested received");
 			}
 		}
 		// 淡出要靠连续重绘驱动——事件循环睡着了提示会卡在最后一帧
