@@ -165,6 +165,15 @@ fn write_file_from_source(
 	Ok(())
 }
 
+thread_local! {
+	/// `NSFilePromiseProvider.delegate` 是 **weak** 属性（Apple 文档明示），
+	/// 自己不强持有的话函数一返回 delegate 就没了，粘贴时永远等不到回调。
+	/// 剪贴板是全局单例，所以这里只需保留「当前这一批」。
+	static LIVE_DELEGATES: std::cell::RefCell<
+		Vec<Retained<ProtocolObject<dyn NSFilePromiseProviderDelegate>>>,
+	> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// 把远端文件清单以 File Promise 方式挂上系统剪贴板，返回 changeCount。
 /// 必须在主线程调用。
 pub fn install_deferred(
@@ -180,6 +189,12 @@ pub fn install_deferred(
 	});
 	let protocol: Retained<ProtocolObject<dyn NSFilePromiseProviderDelegate>> =
 		ProtocolObject::from_retained(delegate);
+	// 强持有到下一批替换为止（见 LIVE_DELEGATES 说明）。
+	LIVE_DELEGATES.with(|slot| {
+		let mut slot = slot.borrow_mut();
+		slot.clear();
+		slot.push(Retained::clone(&protocol));
+	});
 
 	let mut providers: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> =
 		Vec::with_capacity(files.len());
