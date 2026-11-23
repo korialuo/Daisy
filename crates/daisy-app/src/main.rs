@@ -296,7 +296,7 @@ fn main() -> eframe::Result {
 		..Default::default()
 	};
 
-	eframe::run_native(
+	let result = eframe::run_native(
 		daisy_core::APP_NAME,
 		options,
 		Box::new(move |cc| {
@@ -306,7 +306,14 @@ fn main() -> eframe::Result {
 			fonts::install_fonts(&cc.egui_ctx, None);
 			Ok(Box::new(DaisyApp::new(smoke_after, paths, logging)))
 		}),
-	)
+	);
+	// 关闭排障打点：这条能出现，说明 winit/eframe 已经退出，之后只剩
+	// `DaisyApp` 的字段 drop；见不到它则卡在事件循环或 wgpu 收尾。
+	match &result {
+		Ok(()) => tracing::info!("[关闭] run_native 已正常返回，开始 drop DaisyApp"),
+		Err(error) => tracing::warn!("[关闭] run_native 返回错误：{error}"),
+	}
+	result
 }
 
 /// 当前可执行文件的路径。拿不到时给个占位，不让日志因为取路径失败而缺行。
@@ -1558,6 +1565,15 @@ impl DaisyApp {
 impl eframe::App for DaisyApp {
 	/// 每帧绘制之前的非绘制逻辑。
 	fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+		// 关闭排障打点：只打一次。有这条但没「run_native 已正常返回」，
+		// 说明事件循环收到了关闭请求却没走完退出流程。
+		if ctx.input(|input| input.viewport().close_requested()) {
+			static CLOSE_TRACED: std::sync::atomic::AtomicBool =
+				std::sync::atomic::AtomicBool::new(false);
+			if !CLOSE_TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+				tracing::info!("[关闭] egui 收到 close_requested，开始收尾");
+			}
+		}
 		// 淡出要靠连续重绘驱动——事件循环睡着了提示会卡在最后一帧
 		if self.toasts.is_active() {
 			ctx.request_repaint_after(Duration::from_millis(50));
