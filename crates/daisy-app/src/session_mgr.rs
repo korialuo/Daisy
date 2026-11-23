@@ -439,6 +439,18 @@ impl SessionManager {
 
 	/// 取走某个标签页攒下的提示（剪贴板不可用之类），交给应用层弹 toast。
 	///
+	/// 给所有 RDP 会话发一次断开请求（非阻塞）。
+	///
+	/// 关窗口时用：先让远端知道我们走了，别让它把会话晾到 TCP 超时才回收。
+	/// 这里只 `send` 命令，不等回执——真的等就会把关闭流程拖长。
+	pub fn disconnect_all(&mut self) {
+		for tab in &mut self.tabs {
+			if let TabState::Live(TabContent::Rdp(view)) = &tab.state {
+				view.disconnect();
+			}
+		}
+	}
+
 	/// 视图层够不到 `DaisyApp` 的 toast 队列，只能往上递；每帧收一条，
 	/// 堆积的会在后续帧里陆续弹出。
 	pub fn take_notice(&mut self) -> Option<String> {

@@ -1069,6 +1069,11 @@ impl RdpView {
 		&self.title
 	}
 
+	/// 只发断开请求，不等线程收尾（关窗口时用，见 `SessionManager::disconnect_all`）。
+	pub fn disconnect(&self) {
+		self.session.disconnect();
+	}
+
 	/// 断开会话。返回错误文案（正常关闭时为 `None`）。
 	pub fn close(&mut self) -> Option<String> {
 		self.session.disconnect();

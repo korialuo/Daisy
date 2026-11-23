@@ -597,6 +597,9 @@ struct DaisyApp {
 	smoke_fonts: Vec<(Instant, Option<String>)>,
 	/// 有一批单元格尺寸要等新字体生效之后再量（见 [`Self::apply_config`]）。
 	appearance_pending: bool,
+	/// 关闭看门狗是否已经启动。同时也是「正在关闭」标志：为真时 `ui()`
+	/// 直接返回，不再渲染远程桌面。
+	close_watchdog_started: bool,
 	/// 日志句柄。持有写盘守卫与级别热替换句柄。
 	///
 	/// **必须声明在结构体最后**：Rust 的字段 drop 顺序＝声明顺序，而关闭
@@ -649,6 +652,7 @@ impl DaisyApp {
 			smoke_resize_at: smoke_resize_size().map(|_| Instant::now() + SMOKE_RESIZE_DELAY),
 			smoke_fonts: smoke_font_switches(),
 			appearance_pending: false,
+			close_watchdog_started: false,
 		}
 	}
 
@@ -1568,10 +1572,20 @@ impl eframe::App for DaisyApp {
 		// 关闭排障打点：只打一次。有这条但没「run_native 已正常返回」，
 		// 说明事件循环收到了关闭请求却没走完退出流程。
 		if ctx.input(|input| input.viewport().close_requested()) {
-			static CLOSE_TRACED: std::sync::atomic::AtomicBool =
-				std::sync::atomic::AtomicBool::new(false);
-			if !CLOSE_TRACED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+			if !self.close_watchdog_started {
+				self.close_watchdog_started = true;
 				tracing::info!("[CLOSE] egui close_requested received");
+				// 主动断开，别把远端会话晾着等 TCP 超时。
+				self.sessions.disconnect_all();
+				// 看门狗：eframe 在「有活动 RDP 会话」时收不到第二次
+				// CloseRequested（`should_close()` 在事件到来时还是 false），
+				// 正常路径走不完就会一直挂着。给 1.5 秒让正常收尾跑完，
+				// 之后强制退出——宁可少做一点清理，也不能让窗口卡死。
+				std::thread::spawn(|| {
+					std::thread::sleep(Duration::from_millis(1500));
+					tracing::warn!("[CLOSE] watchdog fired, forcing process exit");
+					std::process::exit(0);
+				});
 			}
 		}
 		// 淡出要靠连续重绘驱动——事件循环睡着了提示会卡在最后一帧
@@ -1631,6 +1645,12 @@ impl eframe::App for DaisyApp {
 	}
 
 	fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+		// 已请求关闭：不再渲染远程桌面。RDP 的画面绘制要走纹理上传，是
+		// 关闭路径上最重的一步；跳过它能让这一帧迅速返回，eframe 才有机会
+		// 走完 `handle_close_request`（另一半保险见 `logic` 里的看门狗）。
+		if self.close_watchdog_started {
+			return;
+		}
 		self.bootstrap(ui.ctx());
 		// 换过字体：这一趟 `begin_pass` 已经把新字体换上了，现在量才准。
 		// 放在 `sync_config` 之前——它本帧可能又置一次标志，那要留到下一帧。
