@@ -18,6 +18,20 @@ use daisy_rdp::{
 use crate::design;
 use crate::rdp_session::{RdpSession, RdpStatus};
 
+/// 延迟渲染的按需读取源：持有剪贴板通道的 Arc，跨 COM 线程调 `read_chunk`
+/// 同步等会话线程送字节。macOS 阶段尚未接入，故仅 Windows 编译。
+#[cfg(target_os = "windows")]
+struct ClipboardChunkSource {
+	clipboard: std::sync::Arc<daisy_rdp::Clipboard>,
+}
+
+#[cfg(target_os = "windows")]
+impl crate::deferred_clipboard_win::ChunkSource for ClipboardChunkSource {
+	fn read(&self, index: u32, offset: u64, len: u32) -> Result<Vec<u8>, String> {
+		self.clipboard.read_chunk(index, offset, len)
+	}
+}
+
 /// 每个 [`RdpView`] 的唯一序号，用来生成视口 id。
 ///
 /// **不能用标题或主机拼**：同一台主机可以开两个标签页，id 撞了会让两个
@@ -979,9 +993,14 @@ impl RdpView {
 		params.width = start.0;
 		params.height = start.1;
 		let frame_size = [params.width, params.height];
+		let session = RdpSession::spawn(params.clone(), expected_cert.clone());
+		// Windows/macOS：mstsc 同款延迟渲染——收到描述表只存清单，粘贴时才拉字节。
+		// 必须在任何描述表到达前打开。
+		#[cfg(any(target_os = "windows", target_os = "macos"))]
+		session.set_deferred_mode(true);
 		Self {
 			title,
-			session: RdpSession::spawn(params.clone(), expected_cert.clone()),
+			session,
 			params,
 			expected_cert,
 			state: ViewState::Connecting,
@@ -1372,6 +1391,8 @@ impl RdpView {
 		}
 		// 旧会话已经结束，`Drop` 里的 join 会立刻返回
 		self.session = RdpSession::spawn(self.params.clone(), self.expected_cert.clone());
+		#[cfg(any(target_os = "windows", target_os = "macos"))]
+		self.session.set_deferred_mode(true);
 		self.state = ViewState::Connecting;
 
 		// 上一条会话的残留一概作废——尤其是纹理，否则新会话首帧到达前
@@ -1798,6 +1819,83 @@ impl RdpView {
 		if let Some(error) = self.session.take_download_error() {
 			self.notify(format!("远端文件剪贴板失败：{error}"), true);
 		}
+
+		// 延迟渲染（Windows）：远端复制时只拿到清单，0 字节传输。把清单
+		// 挂成 OLE 延迟渲染剪贴板；真正的文件字节等用户粘贴、IStream::Read
+		// 时才通过 ChunkSource 拉取——与 mstsc 行为一致。
+		#[cfg(target_os = "windows")]
+		if let Some(manifest) = self.session.take_remote_manifest() {
+			let source = ClipboardChunkSource {
+				clipboard: self.session.clipboard_handle(),
+			};
+			let names: Vec<String> = manifest.iter().map(|m| m.name.clone()).collect();
+			match crate::deferred_clipboard_win::install_deferred(
+				manifest,
+				std::sync::Arc::new(source),
+			) {
+				Ok(()) => self.notify(
+					format!(
+						"已就绪 {} 个文件（{}），粘贴时才从远端传输",
+						names.len(),
+						names.join("、")
+					),
+					false,
+				),
+				Err(error) => {
+					// 降级：清单已被取走，这批文件拿不回来了。关掉延迟模式，
+					// 让下次远端复制走「复制即全量下载」兜底，用户重试即可。
+					self.session.set_deferred_mode(false);
+					self.notify(
+						format!(
+							"挂延迟渲染剪贴板失败：{error}；请在远端重新复制一次（已切换兼容模式）"
+						),
+						true,
+					);
+				},
+			}
+		}
+		// macOS：同样用 File Promise 延迟渲染——Finder 粘贴时才拉字节。
+		#[cfg(target_os = "macos")]
+		if let Some(manifest) = self.session.take_remote_manifest() {
+			struct MacChunkSource {
+				clipboard: std::sync::Arc<daisy_rdp::Clipboard>,
+			}
+			impl crate::deferred_clipboard_mac::ChunkSource for MacChunkSource {
+				fn read(&self, index: u32, offset: u64, len: u32) -> Result<Vec<u8>, String> {
+					self.clipboard.read_chunk(index, offset, len)
+				}
+			}
+			let names: Vec<String> = manifest.iter().map(|m| m.name.clone()).collect();
+			let source = MacChunkSource {
+				clipboard: self.session.clipboard_handle(),
+			};
+			match crate::deferred_clipboard_mac::install_deferred(
+				manifest,
+				std::sync::Arc::new(source),
+			) {
+				Ok(_) => self.notify(
+					format!(
+						"已就绪 {} 个文件（{}），粘贴时才从远端传输",
+						names.len(),
+						names.join("、")
+					),
+					false,
+				),
+				Err(error) => {
+					self.session.set_deferred_mode(false);
+					self.notify(
+						format!(
+							"挂 File Promise 失败：{error}；请在远端重新复制一次（已切换兼容模式）"
+						),
+						true,
+					);
+				},
+			}
+		}
+		// 其它平台（Linux 等）暂无延迟渲染实现，清单取走丢弃，走旧全量下载路径。
+		#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+		let _ = self.session.take_remote_manifest();
+
 		if let Some(files) = self.session.take_remote_files() {
 			// 每批一个子目录：跨批不会互相顶出 ` (1)`，文件名保持远端原名。
 			// 旧批次直接清掉——剪贴板同一时刻只有一批能粘。

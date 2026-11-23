@@ -230,6 +230,40 @@ pub struct RemoteFile {
 	pub data: Vec<u8>,
 }
 
+/// 远端剪贴板里某个文件的**元数据**（延迟渲染模式）。
+///
+/// 收到描述表后只解析出名字/大小，不下载字节。本地剪贴板据此声明
+/// 「我提供这些文件」，等目标程序真的粘贴、来读内容时才按需拉取——
+/// 与 mstsc 的行为一致：远端 Ctrl+C 不传数据，本地粘贴那一刻才传。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteFileMeta {
+	pub name: String,
+	pub size: u64,
+}
+
+/// 一次按需块读取（延迟渲染：`IStream::Read` / `writePromiseToURL` 触发）。
+///
+/// 调用方在 COM/AppKit 线程同步等 `reply`，会话线程的 pump 负责发请求、
+/// 收响应后把字节送回。两套 streamId 分段，避免和全量下载撞号。
+struct ChunkReader {
+	stream_id: u32,
+	list_index: u32,
+	offset: u64,
+	len: u32,
+	reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
+	/// `None`=排队未发；`Some`=已发出、等响应（用于超时重发）。
+	sent_at: Option<std::time::Instant>,
+	retries: u8,
+}
+
+/// 按需块读取用的 streamId 起始段——和全量下载（从 1 递增）错开，
+/// 让 [`server_file_contents_response_trampoline`] 能一眼分清响应归谁。
+const CHUNK_STREAM_ID_BASE: u32 = 0x8000_0000;
+
+/// 按需块读取的超时。比全量下载单块略长：COM 线程同步等，宁可多等
+/// 也要给慢链路机会；超时后回错误让目标程序停止粘贴，不能永久挂住。
+const CHUNK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// 待上报的剪贴板内容：文本与文件是**互斥**的两条上报路径，
 /// 格式列表的形态完全不同（文本三种标准格式、文件两种注册格式）。
 #[derive(Debug, Clone)]
@@ -570,6 +604,21 @@ struct ClipboardState {
 	download: Option<Download>,
 	/// 下载失败的文案（界面取走显示 toast）。成功不写这里。
 	download_error: Option<String>,
+	/// 延迟渲染模式：收到描述表后**只存元数据不下载**，等本地粘贴时
+	/// 由 [`Clipboard::read_chunk`] 按需拉取（mstsc 同款行为）。
+	/// 默认 false 保持旧的「复制即全量下载」行为，由上层在挂好本地
+	/// 延迟渲染剪贴板后打开。
+	deferred_mode: bool,
+	/// 延迟渲染时远端文件的元数据清单（名字/大小）。
+	remote_manifest: Option<Vec<RemoteFileMeta>>,
+	/// 延迟渲染清单对应的 clipDataId：读字节时要带上它。
+	manifest_clip_data_id: Option<u32>,
+	/// 清单的文件流是否已锁——第一块读取前发一次 LOCK。
+	manifest_lock_sent: bool,
+	/// 会话线程的按需块读取队列。COM 线程放入、会话线程发出、响应回调送回。
+	chunk_readers: Vec<ChunkReader>,
+	/// 下一个 chunk streamId。
+	next_chunk_stream_id: u32,
 	/// 用户放进来的内容，等会话线程上报格式列表。
 	pending_out: Option<Content>,
 	/// **已上报格式列表、正等远端来索要**的内容。
@@ -792,6 +841,103 @@ impl Clipboard {
 		self.lock().download_error.take()
 	}
 
+	// ---- 延迟渲染（mstsc 同款：粘贴时才传字节）----
+
+	/// 打开/关闭延迟渲染模式。
+	///
+	/// 必须在本地延迟渲染剪贴板**挂好之后**才打开：一旦打开，收到描述表
+	/// 只存元数据、不再自动下载字节，全靠 `read_chunk` 按需拉取。若在
+	/// 本地剪贴板就绪前打开，用户会看到一个「点粘贴却没内容」的空窗。
+	pub fn set_deferred_mode(&self, enabled: bool) {
+		{
+			let mut state = self.lock();
+			state.deferred_mode = enabled;
+			if !enabled {
+				// 关掉时清掉清单，回到全量下载路径不留残留
+				state.remote_manifest = None;
+				state.manifest_clip_data_id = None;
+				state.manifest_lock_sent = false;
+			}
+		}
+		if !enabled {
+			self.fail_all_chunk_readers("延迟渲染已关闭");
+		}
+		tracing::info!("[剪贴板] 延迟渲染模式设为 {enabled}");
+	}
+
+	/// 会话断开/标签页关闭时调用：让所有挂在 `read_chunk` 上的线程立即
+	/// 收到错误返回，绝不留在 `recv_timeout` 上直到超时（否则关闭卡住）。
+	pub fn invalidate_remote_content(&self) {
+		{
+			let mut state = self.lock();
+			state.remote_manifest = None;
+			state.manifest_clip_data_id = None;
+			state.manifest_lock_sent = false;
+			state.remote_files = None;
+			state.download = None;
+		}
+		self.fail_all_chunk_readers("会话已断开，远端文件内容不再可用");
+	}
+
+	pub fn deferred_mode(&self) -> bool {
+		self.lock().deferred_mode
+	}
+
+	/// 取走远端文件清单（延迟渲染）。收到描述表后由 [`Self::take_remote_manifest`]
+	/// 暴露给上层去构造本地延迟渲染剪贴板。取走即清空——一份清单只挂一次。
+	pub fn take_remote_manifest(&self) -> Option<Vec<RemoteFileMeta>> {
+		self.lock().remote_manifest.take()
+	}
+
+	/// 延迟渲染的核心：同步读取远端文件的指定区间。
+	///
+	/// 由本地剪贴板的延迟渲染回调（Windows `IStream::Read` / macOS
+	/// `writePromiseToURL`）在**自己的线程**调用。把请求挂进队列后阻塞，
+	/// 会话线程的 [`Self::flush_outgoing`] 发出 RANGE 请求，
+	/// [`server_file_contents_response_trampoline`] 收响应后送回唤醒。
+	///
+	/// 返回错误而非永久阻塞：目标程序在粘贴失败时要能停下来。
+	pub fn read_chunk(&self, list_index: u32, offset: u64, len: u32) -> Result<Vec<u8>, String> {
+		if len == 0 {
+			return Ok(Vec::new());
+		}
+		let (tx, rx) = std::sync::mpsc::channel();
+		{
+			let mut state = self.lock();
+			if state.manifest_clip_data_id.is_none() {
+				return Err("远端文件清单已失效（会话已断开或换了内容）".to_string());
+			}
+			let stream_id = state.next_chunk_stream_id;
+			state.next_chunk_stream_id = state.next_chunk_stream_id.wrapping_add(1);
+			// 分段起点：避开全量下载从 1 递增的 streamId。
+			let stream_id = CHUNK_STREAM_ID_BASE.wrapping_add(stream_id);
+			state.chunk_readers.push(ChunkReader {
+				stream_id,
+				list_index,
+				offset,
+				len,
+				reply: tx,
+				sent_at: None,
+				retries: 0,
+			});
+			tracing::info!(
+				"[剪贴板] 按需读取排入队列 streamId={stream_id:08x} index={list_index} offset={offset} len={len}"
+			);
+		}
+		// 会话线程每个 pump 周期都会来收，不需要额外叫醒。
+		rx.recv_timeout(CHUNK_READ_TIMEOUT)
+			.unwrap_or_else(|_| Err("读取远端文件超时（服务端未回应）".to_string()))
+	}
+
+	/// 清掉所有未决的按需读取并唤醒等待线程——会话断开/换内容时调用，
+	/// 否则 COM/AppKit 线程会一直挂在 `recv_timeout` 上。
+	fn fail_all_chunk_readers(&self, reason: &str) {
+		let mut state = self.lock();
+		for reader in state.chunk_readers.drain(..) {
+			let _ = reader.reply.send(Err(reason.to_string()));
+		}
+	}
+
 	/// 把待发文本发往远端。**每帧调一次**（会话线程）。
 	///
 	/// 服务端没就绪时不发也不丢——`MonitorReady` 到了自然会补上。
@@ -912,6 +1058,97 @@ impl Clipboard {
 		{
 			let rc = send_unlock_clipdata(context, DOWNLOAD_CLIP_DATA_ID);
 			tracing::info!("[剪贴板] 已发 CB_UNLOCK_CLIPDATA（rc={rc}）");
+		}
+
+		// **延迟渲染：驱动按需块读取。** 与全量下载互斥（同一 clipDataId、
+		// 通道上一次只挂一个未决请求）。清单锁在第一块之前发一次。
+		// 注意：条件里的锁要先算完释放，不能让 guard 活到 if 块内（会重入死锁）。
+		let deferred = self.lock().deferred_mode;
+		if let Some(context) = context.as_mut()
+			&& deferred
+		{
+			let need_lock = {
+				let st = self.lock();
+				st.manifest_clip_data_id.is_some() && !st.manifest_lock_sent
+			};
+			if need_lock {
+				let rc = send_lock_clipdata(context, DOWNLOAD_CLIP_DATA_ID);
+				tracing::info!(
+					"[剪贴板] 延迟渲染：已发 CB_LOCK_CLIPDATA（rc={rc}），等粘贴时按需取字节"
+				);
+				self.lock().manifest_lock_sent = true;
+			}
+
+			// 选一个要发的请求：优先重发卡住的，其次发排队中的第一个。
+			// 通道一次只挂一个未决 RANGE——避免服务端串档。
+			let action = {
+				let mut state = self.lock();
+				// 通道一次只挂一个未决请求：已发的没回来前，不发下一个。
+				let outstanding_pos = state.chunk_readers.iter().position(|r| r.sent_at.is_some());
+				if let Some(pos) = outstanding_pos {
+					// 已发的那个超时了吗？
+					let timed_out = state.chunk_readers[pos]
+						.sent_at
+						.is_some_and(|at| at.elapsed() >= FILE_REQUEST_TIMEOUT);
+					if !timed_out {
+						None // 还在等响应，本帧什么都不发
+					} else {
+						let retries = state.chunk_readers[pos].retries;
+						if retries >= FILE_REQUEST_MAX_RETRIES {
+							// 彻底失败：唤醒等待方并摘掉
+							let reader = state.chunk_readers.remove(pos);
+							let _ = reader.reply.send(Err(format!(
+								"读取远端文件块超时（streamId={:08x}，重试 {retries} 次无响应）",
+								reader.stream_id
+							)));
+							None
+						} else {
+							let reader = &mut state.chunk_readers[pos];
+							reader.retries += 1;
+							reader.sent_at = Some(std::time::Instant::now());
+							tracing::warn!(
+								"[剪贴板] 按需块超时重发第 {} 次 streamId={:08x}",
+								reader.retries,
+								reader.stream_id
+							);
+							Some((
+								reader.stream_id,
+								reader.list_index,
+								reader.offset,
+								reader.len,
+							))
+						}
+					}
+				} else {
+					// 没有未决请求：发排队中的第一个
+					if state.chunk_readers.is_empty() {
+						None
+					} else {
+						let reader = &mut state.chunk_readers[0];
+						reader.sent_at = Some(std::time::Instant::now());
+						Some((
+							reader.stream_id,
+							reader.list_index,
+							reader.offset,
+							reader.len,
+						))
+					}
+				}
+			};
+			if let Some((stream_id, list_index, offset, len)) = action {
+				let request = FileRequest {
+					stream_id,
+					list_index,
+					dw_flags: FILECONTENTS_RANGE,
+					position: offset,
+					count: len,
+					clip_data_id: self.lock().manifest_clip_data_id,
+				};
+				let rc = send_file_contents_request(context, &request);
+				tracing::info!(
+					"[剪贴板] 延迟渲染：已发按需 RANGE streamId={stream_id:08x} index={list_index} pos={offset} len={len}（rc={rc}）"
+				);
+			}
 		}
 
 		let content = {
@@ -1482,18 +1719,43 @@ unsafe extern "C" fn server_format_data_response_trampoline(
 			guard.remote_data_received = true;
 			// **先锁再取**：取数方要主动 `CB_LOCK_CLIPDATA`（见该常量说明）
 			let clip_data_id = Some(DOWNLOAD_CLIP_DATA_ID);
-			match Download::start(entries, clip_data_id) {
-				Ok(download) => {
-					tracing::info!(
-						"[剪贴板] 开始下载远端文件（共 {} 个）",
-						download.entries.len()
-					);
-					guard.download = Some(download);
-				},
-				Err(error) => {
-					tracing::warn!("[剪贴板] 远端文件下载取消：{error}");
-					guard.download_error = Some(error);
-				},
+			if guard.deferred_mode {
+				// 延迟渲染：只存元数据，0 字节传输。上层拿清单去挂本地
+				// 延迟渲染剪贴板，真正的内容等粘贴时由 read_chunk 按需拉。
+				let manifest = entries
+					.iter()
+					.map(|e| RemoteFileMeta {
+						name: e.name.clone(),
+						size: e.size,
+					})
+					.collect::<Vec<_>>();
+				tracing::info!(
+					"[剪贴板] 延迟渲染：记下远端文件清单（{} 个，共 {}），暂不下载",
+					manifest.len(),
+					human_size(manifest.iter().map(|m| m.size).sum())
+				);
+				// 换清单前先把上一批未决读取唤醒（避免旧线程永久等待）
+				for reader in guard.chunk_readers.drain(..) {
+					let _ = reader.reply.send(Err("远端剪贴板内容已更换".to_string()));
+				}
+				guard.remote_manifest = Some(manifest);
+				guard.manifest_clip_data_id = clip_data_id;
+				guard.manifest_lock_sent = false;
+				guard.download = None;
+			} else {
+				match Download::start(entries, clip_data_id) {
+					Ok(download) => {
+						tracing::info!(
+							"[剪贴板] 开始下载远端文件（共 {} 个）",
+							download.entries.len()
+						);
+						guard.download = Some(download);
+					},
+					Err(error) => {
+						tracing::warn!("[剪贴板] 远端文件下载取消：{error}");
+						guard.download_error = Some(error);
+					},
+				}
 			}
 		},
 		_ => match decode_utf16le(bytes) {
@@ -2250,6 +2512,38 @@ unsafe extern "C" fn server_file_contents_response_trampoline(
 	// SAFETY: context 有效。
 	let state = unsafe { state_of(context) };
 	let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+
+	// 按 streamId 分段：高位段是按需读取（延迟渲染），低位段是全量下载。
+	if response.streamId >= CHUNK_STREAM_ID_BASE {
+		let pos = guard
+			.chunk_readers
+			.iter()
+			.position(|r| r.stream_id == response.streamId);
+		if let Some(pos) = pos {
+			let reader = guard.chunk_readers.remove(pos);
+			if ok {
+				tracing::info!(
+					"[剪贴板] 按需读取完成 streamId={:08x} index={} 拿到 {} 字节",
+					reader.stream_id,
+					reader.list_index,
+					data.len()
+				);
+				let _ = reader.reply.send(Ok(data.to_vec()));
+			} else {
+				let _ = reader.reply.send(Err(format!(
+					"远端拒绝提供文件块（index={}，CB_RESPONSE_FAIL）",
+					reader.list_index
+				)));
+			}
+		} else {
+			tracing::warn!(
+				"[剪贴板] 收到无主的按需块响应 streamId={:08x}（已超时或被清）",
+				response.streamId
+			);
+		}
+		return CHANNEL_RC_OK;
+	}
+
 	let Some(download) = guard.download.as_mut() else {
 		tracing::warn!(
 			"[剪贴板] 收到 FileContentsResponse 但没有进行中的下载（streamId={}）",
@@ -3919,5 +4213,122 @@ mod file_clipboard_tests {
 		assert_eq!(files[0].data, b"abcd");
 		assert_eq!(files[1].name, "乙.txt");
 		assert_eq!(files[1].data, b"xyz");
+	}
+
+	/// 构造一个「服务端回过来的描述表」载荷（单文件）。
+	fn descriptor_payload(name: &str, size: u64) -> Vec<u8> {
+		let mut bytes = Vec::new();
+		bytes.extend_from_slice(&1u32.to_le_bytes()); // 文件数
+		let entry = FileEntry {
+			name: name.to_string(),
+			size,
+		};
+		append_file_descriptor(&mut bytes, &entry);
+		bytes
+	}
+
+	/// 延迟渲染：收到描述表后只存清单、不下载；read_chunk 经同步桥拿字节。
+	#[test]
+	fn deferred_manifest_then_chunk_read() {
+		use std::sync::{Mutex as StdMutex, OnceLock};
+		static SENT: OnceLock<StdMutex<Vec<(u32, u32, u64, u32)>>> = OnceLock::new();
+		let sent = SENT.get_or_init(|| StdMutex::new(Vec::new()));
+		sent.lock().unwrap().clear();
+
+		let clipboard = std::sync::Arc::new(Clipboard::new());
+		let mut ctx: ffi::CliprdrClientContext = unsafe { std::mem::zeroed() };
+		unsafe extern "C" fn on_contents_request(
+			_context: *mut ffi::CliprdrClientContext,
+			request: *const ffi::CLIPRDR_FILE_CONTENTS_REQUEST,
+		) -> ffi::UINT {
+			let r = unsafe { &*request };
+			let pos = (u64::from(r.nPositionHigh) << 32) | u64::from(r.nPositionLow);
+			SENT.get_or_init(|| StdMutex::new(Vec::new()))
+				.lock()
+				.unwrap()
+				.push((r.streamId, r.dwFlags, pos, r.cbRequested));
+			0
+		}
+		ctx.ClientFileContentsRequest = Some(on_contents_request);
+		ctx.ClientLockClipboardData = Some(noop_lock_cb);
+		ctx.custom =
+			std::sync::Arc::as_ptr(&clipboard.state) as *mut PluginData as *mut std::ffi::c_void;
+
+		clipboard.set_deferred_mode(true);
+		assert!(clipboard.deferred_mode());
+
+		// 描述表回包 → 只存清单
+		let payload = descriptor_payload("big.bin", 10);
+		let response = ffi::CLIPRDR_FORMAT_DATA_RESPONSE {
+			common: cliprdr_header(
+				CB_FORMAT_DATA_RESPONSE,
+				CB_RESPONSE_OK,
+				payload.len() as u32,
+			),
+			requestedFormatData: payload.as_ptr(),
+		};
+		{
+			let mut st = clipboard.state.lock().unwrap();
+			st.requested = Some(RequestKind::FileDescriptors(0xC0DE));
+		}
+		unsafe { server_format_data_response_trampoline(&mut ctx as *mut _, &response) };
+
+		let manifest = clipboard.take_remote_manifest().expect("应有清单");
+		assert_eq!(manifest.len(), 1);
+		assert_eq!(manifest[0].name, "big.bin");
+		assert_eq!(manifest[0].size, 10);
+		assert!(
+			clipboard.state.lock().unwrap().download.is_none(),
+			"延迟渲染不应启动全量下载"
+		);
+
+		// 单独线程调用 read_chunk（会阻塞），主线程模拟 pump 送响应
+		let cb = std::sync::Arc::clone(&clipboard);
+		let reader = std::thread::spawn(move || cb.read_chunk(0, 0, 4));
+		// 等请求排入队列后，flush 发出 RANGE
+		std::thread::sleep(std::time::Duration::from_millis(50));
+		clipboard.flush_outgoing(Some(&mut ctx));
+		let log = sent.lock().unwrap().clone();
+		assert!(!log.is_empty(), "应发出按需 RANGE 请求");
+		let stream_id = log[0].0;
+		assert!(stream_id >= CHUNK_STREAM_ID_BASE, "streamId 应在按需段");
+		assert_eq!(log[0].1, FILECONTENTS_RANGE);
+
+		// 模拟服务端回 4 字节
+		let data = b"abcd";
+		let range_resp = ffi::CLIPRDR_FILE_CONTENTS_RESPONSE {
+			common: cliprdr_header(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_OK, 4),
+			streamId: stream_id,
+			cbRequested: 4,
+			requestedData: data.as_ptr(),
+		};
+		unsafe { server_file_contents_response_trampoline(&mut ctx as *mut _, &range_resp) };
+
+		let got = reader.join().unwrap().expect("read_chunk 应拿到字节");
+		assert_eq!(got, b"abcd");
+	}
+
+	/// 关闭延迟渲染会唤醒挂在 read_chunk 上的线程，不留永久阻塞。
+	#[test]
+	fn invalidate_wakes_pending_reader() {
+		let clipboard = std::sync::Arc::new(Clipboard::new());
+		clipboard.set_deferred_mode(true);
+		{
+			let mut st = clipboard.state.lock().unwrap();
+			st.manifest_clip_data_id = Some(1);
+		}
+		let cb = std::sync::Arc::clone(&clipboard);
+		let reader = std::thread::spawn(move || cb.read_chunk(0, 0, 4));
+		std::thread::sleep(std::time::Duration::from_millis(50));
+		clipboard.invalidate_remote_content();
+		let result = reader.join().unwrap();
+		assert!(result.is_err(), "会话失效后应返回错误而不是挂住");
+	}
+
+	unsafe extern "C" fn noop_lock_cb(
+		_context: *mut ffi::CliprdrClientContext,
+		_data: *const ffi::CLIPRDR_LOCK_CLIPBOARD_DATA,
+	) -> ffi::UINT {
+		0
 	}
 }

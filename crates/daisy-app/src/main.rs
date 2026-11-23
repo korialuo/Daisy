@@ -46,6 +46,10 @@ use daisy_ssh::{AuthSpec, HostKeyPolicy, RsaSigningPolicy, SshParams, SshTarget,
 use daisy_store::HostSecrets;
 
 mod connect;
+#[cfg(target_os = "macos")]
+mod deferred_clipboard_mac;
+#[cfg(target_os = "windows")]
+mod deferred_clipboard_win;
 mod design;
 mod error;
 mod font_catalog;

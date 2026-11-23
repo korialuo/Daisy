@@ -292,6 +292,10 @@ impl RdpSession {
 						&cursors,
 						&clipboard,
 					);
+					// 会话线程退出（连接失败/断开/关闭）：唤醒所有挂在
+					// 延迟渲染 read_chunk 上的 COM/AppKit 线程，绝不留
+					// 永久阻塞——否则关窗口又变成「未响应」。
+					clipboard.invalidate_remote_content();
 				}
 			})
 			.expect("创建 RDP 会话线程失败");
@@ -353,6 +357,40 @@ impl RdpSession {
 	/// 取走下载完成的远端文件（S10）。`None` 表示没有新东西。
 	pub fn take_remote_files(&self) -> Option<Vec<daisy_rdp::RemoteFile>> {
 		self.clipboard.take_remote_files()
+	}
+
+	/// 取走远端文件清单（延迟渲染模式）。上层据此挂本地延迟渲染剪贴板。
+	#[allow(dead_code)] // 阶段 2/3 的本地延迟渲染剪贴板使用
+	pub fn take_remote_manifest(&self) -> Option<Vec<daisy_rdp::RemoteFileMeta>> {
+		self.clipboard.take_remote_manifest()
+	}
+
+	/// 打开/关闭延迟渲染模式（本地延迟渲染剪贴板就绪后打开）。
+	#[allow(dead_code)] // 阶段 2/3 打开
+	pub fn set_deferred_mode(&self, enabled: bool) {
+		self.clipboard.set_deferred_mode(enabled);
+	}
+
+	#[allow(dead_code)] // 阶段 2/3 查询
+	pub fn deferred_mode(&self) -> bool {
+		self.clipboard.deferred_mode()
+	}
+
+	/// 同步读取远端文件的指定区间（延迟渲染回调调用，会阻塞直到数据到达）。
+	#[allow(dead_code)] // 阶段 2/3 的 IStream::Read / writePromiseToURL 使用
+	pub fn read_remote_chunk(
+		&self,
+		list_index: u32,
+		offset: u64,
+		len: u32,
+	) -> Result<Vec<u8>, String> {
+		self.clipboard.read_chunk(list_index, offset, len)
+	}
+
+	/// 底层剪贴板通道的 Arc（延迟渲染的 ChunkSource 持有它，跨 COM 线程读字节）。
+	#[allow(dead_code)] // 阶段 2/3 使用
+	pub fn clipboard_handle(&self) -> std::sync::Arc<daisy_rdp::Clipboard> {
+		Arc::clone(&self.clipboard)
 	}
 
 	/// 取走远端文件下载失败的文案（一次）。

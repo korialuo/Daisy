@@ -36,7 +36,7 @@ pub mod render;
 pub mod target;
 
 pub use certificate::{CertificateGuard, Observation, Verdict, format_fingerprint};
-pub use clipboard::{Clipboard, LocalFile, RemoteFile};
+pub use clipboard::{Clipboard, LocalFile, RemoteFile, RemoteFileMeta};
 pub use cursor::{CursorBitmap, CursorSprite, decode};
 pub use display::DisplayControl;
 pub use error::{RdpError, Result};
