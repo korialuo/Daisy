@@ -70,26 +70,41 @@ define_class!(
 		) {
 			let index = provider_index(provider);
 			let guard = self.ivars().state.lock().ok();
-			let info = guard.and_then(|s| {
+			let info = guard.as_ref().and_then(|s| {
 				let s = s.as_ref()?;
 				s.files
 					.get(index as usize)
-					.map(|m| (Arc::clone(&s.source), m.size))
+					.map(|m| (Arc::clone(&s.source), m.size, m.name.clone()))
 			});
-			let Some((source, size)) = info else {
+			// 锁只用来取快照，不能在写文件期间一直握着（同一批可能并发粘多个文件）。
+			drop(guard);
+			let Some((source, size, name)) = info else {
+				tracing::warn!("[剪贴板] File Promise 收到未知序号 {index} 的写入请求，放弃");
 				call_completion(completion_handler, true);
 				return;
 			};
 			let Some(path) = url.path() else {
+				tracing::warn!("[剪贴板] File Promise 第 {index} 个「{name}」没有可写路径");
 				call_completion(completion_handler, true);
 				return;
 			};
 			let path = path.to_string();
+			// **这条日志就是「点粘贴才开始传输」的证据**：它出现之前一个字节都没拉过。
+			tracing::info!(
+				"[剪贴板] File Promise 开始写入第 {index} 个「{name}」→ {path}（远端 {size} 字节）"
+			);
 			let handler = SendCompletion(RcBlock::into_raw(completion_handler.copy()) as usize);
+			let started = std::time::Instant::now();
 			std::thread::spawn(move || {
 				let result = write_file_from_source(&source, index, size, &path);
-				if let Err(error) = &result {
-					tracing::warn!("[剪贴板] File Promise 失败：{error}");
+				match &result {
+					Ok(written) => tracing::info!(
+						"[剪贴板] File Promise 完成：第 {index} 个「{name}」{written} 字节，用时 {} ms",
+						started.elapsed().as_millis()
+					),
+					Err(error) => tracing::warn!(
+						"[剪贴板] File Promise 失败：第 {index} 个「{name}」{error}"
+					),
 				}
 				// SAFETY: 裸指针来自 into_raw，系统持有 block 到会话结束。
 				let block = unsafe { &*(handler.0 as *const block2::Block<dyn Fn(*mut NSError)>) };
@@ -144,7 +159,7 @@ fn write_file_from_source(
 	index: u32,
 	size: u64,
 	path: &str,
-) -> Result<(), String> {
+) -> Result<u64, String> {
 	use std::io::Write;
 	let mut file = std::fs::File::create(path).map_err(|e| format!("创建目标文件失败：{e}"))?;
 	const CHUNK: u32 = 256 * 1024;
@@ -155,11 +170,15 @@ fn write_file_from_source(
 		if bytes.is_empty() {
 			return Err(format!("读取到空块（offset={offset}），提前终止"));
 		}
+		tracing::debug!(
+			"[剪贴板] File Promise 拉块 index={index} offset={offset} 得到 {} 字节",
+			bytes.len()
+		);
 		file.write_all(&bytes)
 			.map_err(|e| format!("写文件失败：{e}"))?;
 		offset += bytes.len() as u64;
 	}
-	Ok(())
+	Ok(offset)
 }
 
 thread_local! {
@@ -213,8 +232,13 @@ pub fn install_deferred(
 		return Err("writeObjects 失败，Finder 里将无法粘贴".to_string());
 	}
 	let change = pasteboard.changeCount();
+	let listing = files
+		.iter()
+		.map(|f| format!("{}（{} 字节）", f.name, f.size))
+		.collect::<Vec<_>>()
+		.join("、");
 	tracing::info!(
-		"[剪贴板] 已挂 {} 个 File Promise（changeCount={change}），粘贴时才拉字节",
+		"[剪贴板] 已挂 {} 个 File Promise（changeCount={change}）：{listing}，粘贴时才拉字节",
 		files.len()
 	);
 	Ok(change as i64)

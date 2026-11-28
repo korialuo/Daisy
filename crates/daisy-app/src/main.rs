@@ -1571,22 +1571,20 @@ impl eframe::App for DaisyApp {
 	fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 		// 关闭排障打点：只打一次。有这条但没「run_native 已正常返回」，
 		// 说明事件循环收到了关闭请求却没走完退出流程。
-		if ctx.input(|input| input.viewport().close_requested()) {
-			if !self.close_watchdog_started {
-				self.close_watchdog_started = true;
-				tracing::info!("[CLOSE] egui close_requested received");
-				// 主动断开，别把远端会话晾着等 TCP 超时。
-				self.sessions.disconnect_all();
-				// 看门狗：eframe 在「有活动 RDP 会话」时收不到第二次
-				// CloseRequested（`should_close()` 在事件到来时还是 false），
-				// 正常路径走不完就会一直挂着。给 1.5 秒让正常收尾跑完，
-				// 之后强制退出——宁可少做一点清理，也不能让窗口卡死。
-				std::thread::spawn(|| {
-					std::thread::sleep(Duration::from_millis(1500));
-					tracing::warn!("[CLOSE] watchdog fired, forcing process exit");
-					std::process::exit(0);
-				});
-			}
+		if ctx.input(|input| input.viewport().close_requested()) && !self.close_watchdog_started {
+			self.close_watchdog_started = true;
+			tracing::info!("[CLOSE] egui close_requested received");
+			// 主动断开，别把远端会话晾着等 TCP 超时。
+			self.sessions.disconnect_all();
+			// 看门狗：eframe 在「有活动 RDP 会话」时收不到第二次
+			// CloseRequested（`should_close()` 在事件到来时还是 false），
+			// 正常路径走不完就会一直挂着。给 1.5 秒让正常收尾跑完，
+			// 之后强制退出——宁可少做一点清理，也不能让窗口卡死。
+			std::thread::spawn(|| {
+				std::thread::sleep(Duration::from_millis(1500));
+				tracing::warn!("[CLOSE] watchdog fired, forcing process exit");
+				std::process::exit(0);
+			});
 		}
 		// 淡出要靠连续重绘驱动——事件循环睡着了提示会卡在最后一帧
 		if self.toasts.is_active() {
