@@ -29,6 +29,9 @@ use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::{OleInitialize, OleIsCurrentClipboard, OleSetClipboard};
 use windows::Win32::UI::Shell::FILEDESCRIPTORW;
+use windows::Win32::UI::WindowsAndMessaging::{
+	DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
+};
 use windows::core::{ComObject, ComObjectInner, HRESULT, Ref, implement, w};
 
 use daisy_rdp::RemoteFileMeta;
@@ -531,64 +534,157 @@ thread_local! {
 	/// 我们最近一次挂上去的对象。撤下前要用 `OleIsCurrentClipboard` 确认
 	/// 剪贴板里仍是它——用户后来复制了别的东西时，无条件清空会把用户的
 	/// 剪贴板抹掉。
+	///
+	/// **只在剪贴板 STA 线程里读写**（见 [`clipboard_thread_main`]），
+	/// 所以是 thread_local 而不是全局锁。
 	static CURRENT_OBJECT: std::cell::RefCell<Option<IDataObject>> =
 		const { std::cell::RefCell::new(None) };
+}
+
+/// 投给剪贴板 STA 线程的指令。
+enum StaCommand {
+	Install {
+		files: Vec<RemoteFileMeta>,
+		source: Arc<dyn ChunkSource>,
+		reply: std::sync::mpsc::Sender<Result<(), String>>,
+	},
+	Clear,
+}
+
+/// 取（必要时启动）剪贴板 STA 线程的发送端。
+fn sta_sender() -> Option<&'static std::sync::mpsc::Sender<StaCommand>> {
+	use std::sync::OnceLock;
+	static SENDER: OnceLock<Option<std::sync::mpsc::Sender<StaCommand>>> = OnceLock::new();
+	SENDER.get_or_init(spawn_clipboard_thread).as_ref()
+}
+
+fn spawn_clipboard_thread() -> Option<std::sync::mpsc::Sender<StaCommand>> {
+	let (tx, rx) = std::sync::mpsc::channel::<StaCommand>();
+	match std::thread::Builder::new()
+		.name("daisy-clipboard-sta".to_string())
+		.spawn(move || clipboard_thread_main(rx))
+	{
+		Ok(_) => Some(tx),
+		Err(error) => {
+			tracing::warn!("[剪贴板] 起剪贴板 STA 线程失败：{error}");
+			None
+		},
+	}
+}
+
+/// 剪贴板 STA 线程主体。
+///
+/// **为什么必须另起线程**：`OleSetClipboard` 之后，取数方（资源管理器）
+/// 的 `GetData` / `IStream::Read` 会通过 COM 回到**持有对象的那个 STA 线程**
+/// 上执行。挂在 UI 线程上时，每读一块（256 KB，慢链路 200~500 ms）就把
+/// 界面冻一次；40 MB 要读 160 块，等于整窗「未响应」半分钟——用户只会去
+/// 关窗口/断开会话，于是后续读取全部拿到「会话已断开」。
+/// mstsc 同样把数据对象放在独立 STA 线程，这里对齐。
+fn clipboard_thread_main(rx: std::sync::mpsc::Receiver<StaCommand>) {
+	// SAFETY: 本线程独占，第一次调用即把线程初始化成 STA。
+	let _ole = unsafe { OleInitialize(None) };
+	loop {
+		while let Ok(command) = rx.try_recv() {
+			match command {
+				StaCommand::Install {
+					files,
+					source,
+					reply,
+				} => {
+					let result = install_on_this_thread(files, source);
+					let _ = reply.send(result);
+				},
+				StaCommand::Clear => {
+					let still_ours = CURRENT_OBJECT.with(|slot| {
+						let slot = slot.borrow();
+						match slot.as_ref() {
+							// SAFETY: 同一 STA 线程，OLE 已初始化。
+							Some(object) => unsafe { OleIsCurrentClipboard(object).is_ok() },
+							None => false,
+						}
+					});
+					if still_ours {
+						// SAFETY: 同上。
+						unsafe {
+							let _ = OleSetClipboard(None);
+						}
+						tracing::info!("[剪贴板] 已撤下延迟渲染剪贴板");
+					}
+					CURRENT_OBJECT.with(|slot| *slot.borrow_mut() = None);
+				},
+			}
+		}
+		// 泵消息：跨进程的 COM 调用要靠这里派发。5ms 轮询足够，且不至于空转。
+		// SAFETY: 线程内调用，参数合法。
+		unsafe {
+			let mut message = MSG::default();
+			while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+				let _ = TranslateMessage(&message);
+				DispatchMessageW(&message);
+			}
+		}
+		std::thread::sleep(std::time::Duration::from_millis(5));
+	}
+}
+
+/// 在本（STA）线程内建对象并交给 OLE。
+fn install_on_this_thread(
+	files: Vec<RemoteFileMeta>,
+	source: Arc<dyn ChunkSource>,
+) -> Result<(), String> {
+	let formats = register_formats();
+	let data_object = DeferredDataObject {
+		files: files
+			.into_iter()
+			.map(|meta| DeferredFile { meta })
+			.collect(),
+		source,
+		formats,
+	};
+	let com: ComObject<DeferredDataObject> = data_object.into_object();
+	let iface: IDataObject = com.into_interface();
+	// SAFETY: 本线程是已初始化的 STA。
+	unsafe { OleSetClipboard(Some(&iface)) }
+		.map_err(|error| format!("OleSetClipboard 失败：{error}"))?;
+	CURRENT_OBJECT.with(|slot| *slot.borrow_mut() = Some(iface));
+	Ok(())
 }
 
 /// 撤掉我们自己挂的延迟渲染剪贴板。
 ///
 /// 会话断开/退出时必须调用：否则 OLE 仍持有 `IDataObject`，系统做剪贴板
 /// flush 时会挨个找我们要 `CFSTR_FILECONTENTS`，而字节已经拉不到了——
-/// 表现就是关窗口卡在「未响应」。清掉后剪贴板退回系统默认（与 mstsc 退出
-/// 后远端文件失效的行为一致）。
+/// 表现就是关窗口卡在「未响应」。**异步投递，不等回执**，免得关闭流程
+/// 被 STA 线程拖住。
 pub fn clear_deferred() {
-	let still_ours = CURRENT_OBJECT.with(|slot| {
-		let slot = slot.borrow();
-		match slot.as_ref() {
-			// SAFETY: 与 install_deferred 同线程（UI 主线程），OLE 已初始化。
-			Some(object) => unsafe { OleIsCurrentClipboard(object).is_ok() },
-			None => false,
-		}
-	});
-	if still_ours {
-		// SAFETY: 同上。
-		unsafe {
-			let _ = OleSetClipboard(None);
-		}
-		tracing::info!("[剪贴板] 已撤下延迟渲染剪贴板");
+	if let Some(tx) = sta_sender() {
+		let _ = tx.send(StaCommand::Clear);
 	}
-	CURRENT_OBJECT.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// 把一批远端文件以延迟渲染方式挂上剪贴板。成功后目标程序粘贴时才拉字节。
-/// 必须在 STA 线程（UI 主线程）调用。
+///
+/// 实际工作投给剪贴板 STA 线程（见 [`clipboard_thread_main`]），本函数只等
+/// 一次「挂上了没有」的回执，通常几毫秒。
 pub fn install_deferred(
 	files: Vec<RemoteFileMeta>,
 	source: Arc<dyn ChunkSource>,
-) -> windows::core::Result<()> {
+) -> Result<(), String> {
 	if files.is_empty() {
 		return Ok(());
 	}
-	// SAFETY: 幂等；UI 主线程已是 STA。
-	unsafe { OleInitialize(None).ok() };
-
-	let formats = register_formats();
-	let deferred_files = files
-		.into_iter()
-		.map(|meta| DeferredFile { meta })
-		.collect();
-	let data_object = DeferredDataObject {
-		files: deferred_files,
-		source,
-		formats,
+	let Some(tx) = sta_sender() else {
+		return Err("剪贴板线程不可用".to_string());
 	};
-	let com: ComObject<DeferredDataObject> = data_object.into_object();
-	let iface: IDataObject = com.into_interface();
-	// SAFETY: iface 在 OleSetClipboard 成功后由 OLE 持有引用。
-	let result = unsafe { OleSetClipboard(Some(&iface)) };
-	if result.is_ok() {
-		// 留一份给 clear_deferred 做归属判断（clone 只 AddRef，不复制数据）。
-		CURRENT_OBJECT.with(|slot| *slot.borrow_mut() = Some(iface));
+	let (reply, reply_rx) = std::sync::mpsc::channel();
+	tx.send(StaCommand::Install {
+		files,
+		source,
+		reply,
+	})
+	.map_err(|_| "剪贴板线程已退出".to_string())?;
+	match reply_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+		Ok(result) => result,
+		Err(_) => Err("剪贴板线程无响应（挂载超时）".to_string()),
 	}
-	result
 }
