@@ -264,6 +264,16 @@ const CHUNK_STREAM_ID_BASE: u32 = 0x8000_0000;
 /// 也要给慢链路机会；超时后回错误让目标程序停止粘贴，不能永久挂住。
 const CHUNK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
+/// 一个按需块请求该等多久。
+///
+/// 预取块可以到 4 MB，固定的 8 秒在慢链路上会把「还没传完」误判成超时
+/// （接着重发、甚至让调用方直接失败）。按 0.4 MB/s 的保守速率估一个
+/// 时间，再加 5 秒固定余量；小块仍以 [`CHUNK_READ_TIMEOUT`] 为下限。
+fn request_wait(len: u32) -> std::time::Duration {
+	let estimate = std::time::Duration::from_secs(u64::from(len) / (400 * 1024) + 5);
+	CHUNK_READ_TIMEOUT.max(estimate)
+}
+
 /// 待上报的剪贴板内容：文本与文件是**互斥**的两条上报路径，
 /// 格式列表的形态完全不同（文本三种标准格式、文件两种注册格式）。
 #[derive(Debug, Clone)]
@@ -975,7 +985,7 @@ impl Clipboard {
 			);
 		}
 		// 会话线程每个 pump 周期都会来收，不需要额外叫醒。
-		rx.recv_timeout(CHUNK_READ_TIMEOUT)
+		rx.recv_timeout(request_wait(len))
 			.unwrap_or_else(|_| Err("读取远端文件超时（服务端未回应）".to_string()))
 	}
 
@@ -1136,10 +1146,10 @@ impl Clipboard {
 				// 通道一次只挂一个未决请求：已发的没回来前，不发下一个。
 				let outstanding_pos = state.chunk_readers.iter().position(|r| r.sent_at.is_some());
 				if let Some(pos) = outstanding_pos {
-					// 已发的那个超时了吗？
+					// 已发的那个超时了吗？（按块大小估算，别把大预取块误判成超时）
 					let timed_out = state.chunk_readers[pos]
 						.sent_at
-						.is_some_and(|at| at.elapsed() >= FILE_REQUEST_TIMEOUT);
+						.is_some_and(|at| at.elapsed() >= request_wait(state.chunk_readers[pos].len));
 					if !timed_out {
 						None // 还在等响应，本帧什么都不发
 					} else {

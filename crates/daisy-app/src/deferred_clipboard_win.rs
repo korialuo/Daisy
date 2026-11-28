@@ -72,15 +72,18 @@ struct DeferredStream {
 	pos: Mutex<u64>,
 	/// 预取的一段（`start` + 数据）。命中就直接拷给调用方。
 	cache: Mutex<Prefetch>,
+	/// 远端拒绝过大 `cbRequested` 后置位，之后只按调用方给的块宽要，
+	/// 免得每次都先失败一次再重试。
+	no_prefetch: std::sync::atomic::AtomicBool,
 }
 
 /// 一次向远端要多大的块。
 ///
-/// 目标程序（资源管理器）每次 `Read` 只给 256 KB，而 RDP 的文件通道是
-/// 串行往返：一次请求-应答实测 170~500 ms。40 MB 就是 160 个来回，只有
-/// 约 0.85 MB/s。这里按 1 MB 预取，把四次 `Read` 合并成一次请求，
-/// 往返次数降到 1/4。
-const PREFETCH_BYTES: u32 = 1024 * 1024;
+/// 目标程序（资源管理器）每次 `Read` 只给 256 KB，而我们的按需读取在通道
+/// 上是一次请求-应答：日志实测 170~500 ms/块（约 0.85 MB/s）。40 MB 就是
+/// 160 个来回，其中还有 160 次「排队等会话线程 pump（30 ms）才发出去」。
+/// 按 4 MB 预取后，一次请求覆盖 16 次 `Read`，往返和排队都降到 1/16。
+const PREFETCH_BYTES: u32 = 4 * 1024 * 1024;
 
 #[derive(Default)]
 struct Prefetch {
@@ -110,6 +113,7 @@ impl DeferredStream {
 			size,
 			pos: Mutex::new(0),
 			cache: Mutex::new(Prefetch::default()),
+			no_prefetch: std::sync::atomic::AtomicBool::new(false),
 		}
 	}
 }
@@ -145,9 +149,14 @@ impl ISequentialStream_Impl for DeferredStream_Impl {
 			}
 			return S_OK;
 		}
-		// 没命中：整段重取。**多要一倍到 1MB**，剩下的留给后面几次 Read。
+		// 没命中：整段重取。**多要一大段**，剩下的留给后面十几次 Read。
 		cache.clear();
-		let ask = u64::from(PREFETCH_BYTES.max(want)).min(self.size - *pos) as u32;
+		let remaining = self.size - *pos;
+		let ask = if self.no_prefetch.load(std::sync::atomic::Ordering::Relaxed) {
+			want
+		} else {
+			u64::from(PREFETCH_BYTES.max(want)).min(remaining) as u32
+		};
 		let offset = *pos;
 		match self.source.read(self.index, offset, ask) {
 			Ok(bytes) => {
@@ -175,6 +184,9 @@ impl ISequentialStream_Impl for DeferredStream_Impl {
 				// RANGE 请求（对大 `cbRequested` 直接回 FAIL）。退回 256 KB
 				// 至少能把这次粘贴走通，不至于整份文件废掉。
 				if ask > want
+					&& !self
+						.no_prefetch
+						.swap(true, std::sync::atomic::Ordering::Relaxed)
 					&& let Ok(bytes) = self.source.read(self.index, offset, want)
 					&& !bytes.is_empty()
 				{
