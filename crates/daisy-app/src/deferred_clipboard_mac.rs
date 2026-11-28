@@ -188,6 +188,29 @@ thread_local! {
 	static LIVE_DELEGATES: std::cell::RefCell<
 		Vec<Retained<ProtocolObject<dyn NSFilePromiseProviderDelegate>>>,
 	> = const { std::cell::RefCell::new(Vec::new()) };
+
+	/// 挂上去那一刻的 `changeCount`，用来判断剪贴板里还是不是我们那批
+	/// （对应 Windows 侧的 `OleIsCurrentClipboard`）。
+	static LIVE_CHANGE: std::cell::Cell<isize> = const { std::cell::Cell::new(-1) };
+}
+
+/// 撤下我们挂的 File Promise（会话断开/退出时调用）。
+///
+/// 与 Windows 侧 `clear_deferred` 对齐：**先放手 delegate**，Finder 再粘贴
+/// 就会立刻失败，而不是挂在 `read_chunk` 上等满 8 s 超时（用户看到的是
+/// 「正在拷贝」僵住）。剪贴板里仍是这一批时才清空——用户后来复制了别的
+/// 东西就不要动他的剪贴板。
+pub fn clear_deferred() {
+	let still_ours = LIVE_CHANGE.with(|slot| {
+		let ours = NSPasteboard::generalPasteboard().changeCount() == slot.get();
+		slot.set(-1);
+		ours
+	});
+	LIVE_DELEGATES.with(|slot| slot.borrow_mut().clear());
+	if still_ours {
+		NSPasteboard::generalPasteboard().clearContents();
+		tracing::info!("[剪贴板] 已撤下 File Promise 剪贴板");
+	}
 }
 
 /// 把远端文件清单以 File Promise 方式挂上系统剪贴板，返回 changeCount。
@@ -232,6 +255,7 @@ pub fn install_deferred(
 		return Err("writeObjects 失败，Finder 里将无法粘贴".to_string());
 	}
 	let change = pasteboard.changeCount();
+	LIVE_CHANGE.with(|slot| slot.set(change));
 	let listing = files
 		.iter()
 		.map(|f| format!("{}（{} 字节）", f.name, f.size))

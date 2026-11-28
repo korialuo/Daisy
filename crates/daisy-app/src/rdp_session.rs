@@ -512,6 +512,13 @@ impl Drop for RdpSession {
 			crate::deferred_clipboard_win::clear_deferred();
 			tracing::info!("[CLOSE] deferred clipboard cleared");
 		}
+		// macOS：同上。放手 delegate 后 Finder 粘贴立刻失败，不会挂在
+		// `read_chunk` 上等满 8 s 超时。
+		#[cfg(target_os = "macos")]
+		{
+			crate::deferred_clipboard_mac::clear_deferred();
+			tracing::info!("[CLOSE] file promise clipboard cleared");
+		}
 		let Some(join) = self.join.take() else {
 			tracing::info!("[CLOSE] no join handle");
 			return;

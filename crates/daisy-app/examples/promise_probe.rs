@@ -4,6 +4,7 @@
 
 #[cfg(target_os = "macos")]
 #[path = "../src/deferred_clipboard_mac.rs"]
+#[allow(dead_code)] // 探针只用 install_deferred，其余入口是给正式代码用的
 mod deferred_clipboard_mac;
 
 #[cfg(target_os = "macos")]
