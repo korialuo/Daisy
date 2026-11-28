@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::{
-	DATA_S_SAMEFORMATETC, DV_E_FORMATETC, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_POINTER, HGLOBAL,
-	S_FALSE, S_OK,
+	DATA_S_SAMEFORMATETC, DV_E_FORMATETC, DV_E_LINDEX, DV_E_TYMED, E_FAIL, E_INVALIDARG, E_NOTIMPL,
+	E_POINTER, HGLOBAL, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
 	DATADIR_GET, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl, IEnumFORMATETC,
@@ -99,7 +99,10 @@ impl ISequentialStream_Impl for DeferredStream_Impl {
 		let offset = *pos;
 		match self.source.read(self.index, offset, want) {
 			Ok(bytes) => {
-				let n = bytes.len() as u32;
+				// **绝不能写超过 cb**：目标程序（资源管理器）的缓冲只有 cb 字节，
+				// 多写就是踩坏它的堆；`*pcbread > cb` 在 shell 里直接判 E_BOUNDS
+				// （「数组绑定无效」）。只信请求长度，不信来源给的长度。
+				let n = (bytes.len() as u64).min(want as u64) as u32;
 				// SAFETY: 目标缓冲 >= cb 字节；n <= want <= cb。
 				unsafe {
 					std::ptr::copy_nonoverlapping(bytes.as_ptr(), pv.cast::<u8>(), n as usize)
@@ -197,8 +200,20 @@ impl IStream_Impl for DeferredStream_Impl {
 		if pstatstg.is_null() {
 			return Err(E_POINTER.into());
 		}
-		// 只填 cbSize（资源管理器据此建目标文件），其余留零。
-		unsafe { (*pstatstg).cbSize = self.size };
+		// SAFETY: pstatstg 由调用方提供、可写。
+		unsafe {
+			// 整个结构先清零：pwcsName / type / 时间戳/ clsid 留 0 才是「合法空值」，
+			// 让调用方拿到的不是上一轮残留的垃圾。type 必须是 STGTY_STREAM（2），
+			// 否则资源管理器按 storage 解释这个流，取内容时就越界。
+			std::ptr::write_bytes(pstatstg.cast::<u8>(), 0, std::mem::size_of::<STATSTG>());
+			(*pstatstg).cbSize = self.size;
+			// grfMode 保持清零即为 STGM_READ；只补 type。
+			pstatstg
+				.cast::<u8>()
+				.add(std::mem::offset_of!(STATSTG, r#type))
+				.cast::<u32>()
+				.write_unaligned(2); // STGTY_STREAM
+		}
 		Ok(())
 	}
 
@@ -273,11 +288,20 @@ impl DeferredDataObject {
 	}
 
 	/// 构造 FILEGROUPDESCRIPTORW：cItems + N 个 FILEDESCRIPTORW。
-	fn build_descriptor(&self) -> Vec<u8> {
-		let n = self.files.len();
+	///
+	/// `only = Some(i)` 时只输出第 i 条**单个** `FILEDESCRIPTORW`（不带 cItems）：
+	/// 有些取数方（含资源管理器的部分路径）会用 `lindex >= 0` 单独索引描述符，
+	/// 此时塞给它整个组会被当成单条解析——长度对不上就是 E_BOUNDS。
+	fn build_descriptor(&self, only: Option<usize>) -> Option<Vec<u8>> {
+		let selected: Vec<&DeferredFile> = match only {
+			Some(index) => vec![self.files.get(index)?],
+			None => self.files.iter().collect(),
+		};
 		let mut bytes = Vec::new();
-		bytes.extend_from_slice(&(n as u32).to_le_bytes());
-		for file in &self.files {
+		if only.is_none() {
+			bytes.extend_from_slice(&(selected.len() as u32).to_le_bytes());
+		}
+		for file in selected {
 			// FILEDESCRIPTORW 是 packed(1)，字段可能未对齐——逐字节按偏移写，
 			// 不直接访问字段（Rust 对 packed 字段取引用会编译失败）。
 			let mut d = FILEDESCRIPTORW::default();
@@ -318,7 +342,7 @@ impl DeferredDataObject {
 			};
 			bytes.extend_from_slice(raw);
 		}
-		bytes
+		Some(bytes)
 	}
 }
 
@@ -329,8 +353,30 @@ impl IDataObject_Impl for DeferredDataObject_Impl {
 		}
 		// SAFETY: 调用方保证指针有效。
 		let etc = unsafe { &*pformatetcin };
+		// 这一行是排查「粘贴报错」的第一手证据：取数方到底按哪个格式、
+		// 哪个序号、哪种介质类型来要数据（mstsc 也只提供同一组组合）。
+		tracing::info!(
+			"[剪贴板] GetData cf={:#06x} lindex={} tymed={:#06x}",
+			etc.cfFormat,
+			etc.lindex,
+			etc.tymed
+		);
 		if etc.cfFormat == self.formats.file_descriptor {
-			let bytes = self.build_descriptor();
+			if etc.tymed & (TYMED_HGLOBAL.0 as u32) == 0 {
+				tracing::warn!(
+					"[剪贴板] 拒绝描述表：tymed={:#06x} 不含 HGLOBAL",
+					etc.tymed
+				);
+				return Err(DV_E_TYMED.into());
+			}
+			let only = if etc.lindex >= 0 {
+				Some(etc.lindex as usize)
+			} else {
+				None
+			};
+			let Some(bytes) = self.build_descriptor(only) else {
+				return Err(DV_E_LINDEX.into());
+			};
 			// SAFETY: GMEM_MOVEABLE 是 SetClipboardData/STGMEDIUM 的硬性要求。
 			let hglobal: HGLOBAL = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }?;
 			let ptr = unsafe { GlobalLock(hglobal) };
@@ -344,9 +390,24 @@ impl IDataObject_Impl for DeferredDataObject_Impl {
 				pUnkForRelease: ManuallyDrop::new(None),
 			})
 		} else if etc.cfFormat == self.formats.file_contents {
-			let index = etc.lindex.max(0) as u32;
+			// **只提供 IStream**：`QueryGetData` 里也必须照这个口径拒绝
+			// `TYMED_HGLOBAL`。否则取数方以为能拿到内存块，`GetData` 却收到
+			// 流指针，按 HGLOBAL 去解析——资源管理器在这里报的就是
+			// 「数组绑定无效」（E_BOUNDS）。
+			if etc.tymed & (TYMED_ISTREAM.0 as u32) == 0 {
+				tracing::warn!(
+					"[剪贴板] 拒绝文件内容：tymed={:#06x} 不含 ISTREAM",
+					etc.tymed
+				);
+				return Err(DV_E_TYMED.into());
+			}
+			let index = if etc.lindex < 0 {
+				0
+			} else {
+				etc.lindex as u32
+			};
 			let Some(file) = self.files.get(index as usize) else {
-				return Err(E_INVALIDARG.into());
+				return Err(DV_E_LINDEX.into());
 			};
 			let stream = DeferredStream::new(Arc::clone(&self.source), index, file.meta.size);
 			let iface: IStream = stream.into_object().into_interface();
@@ -376,10 +437,27 @@ impl IDataObject_Impl for DeferredDataObject_Impl {
 			return E_POINTER;
 		}
 		let etc = unsafe { &*pformatetc };
-		if etc.cfFormat == self.formats.file_descriptor
-			|| etc.cfFormat == self.formats.file_contents
-		{
-			S_OK
+		let index_ok = etc.lindex < 0 || (etc.lindex as usize) < self.files.len();
+		if etc.cfFormat == self.formats.file_descriptor {
+			if etc.tymed & (TYMED_HGLOBAL.0 as u32) == 0 {
+				return DV_E_TYMED;
+			}
+			if index_ok {
+				S_OK
+			} else {
+				DV_E_LINDEX
+			}
+		} else if etc.cfFormat == self.formats.file_contents {
+			// 这里必须与 `GetData` 完全一致：声明只给 IStream，就不能对
+			// `TYMED_HGLOBAL` 的询问回 S_OK。
+			if etc.tymed & (TYMED_ISTREAM.0 as u32) == 0 {
+				return DV_E_TYMED;
+			}
+			if index_ok {
+				S_OK
+			} else {
+				DV_E_LINDEX
+			}
 		} else {
 			S_FALSE
 		}
@@ -409,11 +487,23 @@ impl IDataObject_Impl for DeferredDataObject_Impl {
 		if dwdirection != DATADIR_GET.0 as u32 {
 			return Err(E_NOTIMPL.into());
 		}
+		// 一个文件一条 `FileContents`（lindex = 文件序号）。只给 lindex=0 时，
+		// 只有第一个文件取得到内容，其余在组里「有描述符没有内容」，
+		// shell 按描述符数量取内容就索引越界——同样是「数组绑定无效」。
+		let mut formats = vec![self.format_etc(
+			self.formats.file_descriptor,
+			TYMED_HGLOBAL.0 as u32,
+			-1,
+		)];
+		for index in 0..self.files.len() {
+			formats.push(self.format_etc(
+				self.formats.file_contents,
+				TYMED_ISTREAM.0 as u32,
+				index as i32,
+			));
+		}
 		let enumerator = FormatEnumerator {
-			formats: vec![
-				self.format_etc(self.formats.file_descriptor, TYMED_HGLOBAL.0 as u32, -1),
-				self.format_etc(self.formats.file_contents, TYMED_ISTREAM.0 as u32, 0),
-			],
+			formats,
 			pos: Mutex::new(0),
 		};
 		Ok(enumerator.into_object().into_interface())
