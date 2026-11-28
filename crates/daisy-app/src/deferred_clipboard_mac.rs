@@ -162,7 +162,10 @@ fn write_file_from_source(
 ) -> Result<u64, String> {
 	use std::io::Write;
 	let mut file = std::fs::File::create(path).map_err(|e| format!("创建目标文件失败：{e}"))?;
-	const CHUNK: u32 = 256 * 1024;
+	// 一次要 1 MB：RDP 的文件通道是串行往返（一次请求-应答实测 170~500 ms），
+	// 256 KB 一块的话 40 MB 要 160 个来回，只有 0.85 MB/s。块放大到 1 MB
+	// 把往返次数压到 1/4。
+	const CHUNK: u32 = 1024 * 1024;
 	let mut offset = 0u64;
 	while offset < size {
 		let len = (CHUNK as u64).min(size - offset) as u32;

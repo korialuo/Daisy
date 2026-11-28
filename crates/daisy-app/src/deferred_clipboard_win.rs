@@ -70,6 +70,36 @@ struct DeferredStream {
 	index: u32,
 	size: u64,
 	pos: Mutex<u64>,
+	/// 预取的一段（`start` + 数据）。命中就直接拷给调用方。
+	cache: Mutex<Prefetch>,
+}
+
+/// 一次向远端要多大的块。
+///
+/// 目标程序（资源管理器）每次 `Read` 只给 256 KB，而 RDP 的文件通道是
+/// 串行往返：一次请求-应答实测 170~500 ms。40 MB 就是 160 个来回，只有
+/// 约 0.85 MB/s。这里按 1 MB 预取，把四次 `Read` 合并成一次请求，
+/// 往返次数降到 1/4。
+const PREFETCH_BYTES: u32 = 1024 * 1024;
+
+#[derive(Default)]
+struct Prefetch {
+	start: u64,
+	data: Vec<u8>,
+}
+
+impl Prefetch {
+	fn clear(&mut self) {
+		self.start = 0;
+		self.data.clear();
+	}
+
+	/// `pos` 起 `want` 字节是否全在缓存里。
+	fn covers(&self, pos: u64, want: u32) -> bool {
+		!self.data.is_empty()
+			&& pos >= self.start
+			&& pos + u64::from(want) <= self.start + self.data.len() as u64
+	}
 }
 
 impl DeferredStream {
@@ -79,6 +109,7 @@ impl DeferredStream {
 			index,
 			size,
 			pos: Mutex::new(0),
+			cache: Mutex::new(Prefetch::default()),
 		}
 	}
 }
@@ -99,8 +130,26 @@ impl ISequentialStream_Impl for DeferredStream_Impl {
 			return S_OK; // EOF：0 字节 + S_OK
 		}
 		let want = (cb as u64).min(self.size - *pos) as u32;
+		let mut cache = self.cache.lock().unwrap();
+		// 命中预取：上一次多要的那部分直接拷出去，不再往返。
+		if cache.covers(*pos, want) {
+			let offset = (*pos - cache.start) as usize;
+			let n = want as usize;
+			// SAFETY: 目标缓冲 >= cb 字节；n <= want <= cb。
+			unsafe {
+				std::ptr::copy_nonoverlapping(cache.data[offset..].as_ptr(), pv.cast::<u8>(), n)
+			};
+			*pos += n as u64;
+			if !pcbread.is_null() {
+				unsafe { *pcbread = n as u32 };
+			}
+			return S_OK;
+		}
+		// 没命中：整段重取。**多要一倍到 1MB**，剩下的留给后面几次 Read。
+		cache.clear();
+		let ask = u64::from(PREFETCH_BYTES.max(want)).min(self.size - *pos) as u32;
 		let offset = *pos;
-		match self.source.read(self.index, offset, want) {
+		match self.source.read(self.index, offset, ask) {
 			Ok(bytes) => {
 				// **绝不能写超过 cb**：目标程序（资源管理器）的缓冲只有 cb 字节，
 				// 多写就是踩坏它的堆；`*pcbread > cb` 在 shell 里直接判 E_BOUNDS
@@ -110,6 +159,11 @@ impl ISequentialStream_Impl for DeferredStream_Impl {
 				unsafe {
 					std::ptr::copy_nonoverlapping(bytes.as_ptr(), pv.cast::<u8>(), n as usize)
 				};
+				// 多要来的部分留在缓存里给后续 Read（避免越界：n <= bytes.len()）。
+				if (n as usize) < bytes.len() {
+					cache.start = offset + u64::from(n);
+					cache.data.extend_from_slice(&bytes[n as usize..]);
+				}
 				*pos += n as u64;
 				if !pcbread.is_null() {
 					unsafe { *pcbread = n };
@@ -117,6 +171,29 @@ impl ISequentialStream_Impl for DeferredStream_Impl {
 				S_OK
 			},
 			Err(error) => {
+				// 预取失败就退回最小块再试一次：有服务端不接受过大的
+				// RANGE 请求（对大 `cbRequested` 直接回 FAIL）。退回 256 KB
+				// 至少能把这次粘贴走通，不至于整份文件废掉。
+				if ask > want
+					&& let Ok(bytes) = self.source.read(self.index, offset, want)
+					&& !bytes.is_empty()
+				{
+					let n = (bytes.len() as u64).min(want as u64) as u32;
+					// SAFETY: 目标缓冲 >= cb 字节；n <= want <= cb。
+					unsafe {
+						std::ptr::copy_nonoverlapping(bytes.as_ptr(), pv.cast::<u8>(), n as usize)
+					};
+					*pos += n as u64;
+					if !pcbread.is_null() {
+						unsafe { *pcbread = n };
+					}
+					tracing::info!(
+						"[剪贴板] 预取 {} 字节失败（{error}），已退回 {} 字节",
+						ask,
+						want
+					);
+					return S_OK;
+				}
 				tracing::warn!("[剪贴板] 延迟渲染 Read 失败 index={}：{error}", self.index);
 				if !pcbread.is_null() {
 					unsafe { *pcbread = 0 };
@@ -152,7 +229,19 @@ impl IStream_Impl for DeferredStream_Impl {
 			return Err(E_INVALIDARG.into());
 		};
 		let new_pos = base.saturating_add(dlibmove).max(0) as u64;
-		*pos = new_pos.min(self.size);
+		let new_pos = new_pos.min(self.size);
+		// 位置变了才丢预取：取数方常拿 `Seek(0, CUR)` 问当前位置，
+		// 那种调用不该把已经预取好的数据扔掉。
+		{
+			let mut cache = self.cache.lock().unwrap();
+			if !cache.data.is_empty() {
+				let end = cache.start + cache.data.len() as u64;
+				if new_pos < cache.start || new_pos > end {
+					cache.clear();
+				}
+			}
+		}
+		*pos = new_pos;
 		if !plibnewposition.is_null() {
 			unsafe { *plibnewposition = *pos };
 		}
@@ -314,7 +403,10 @@ impl DeferredDataObject {
 			unsafe {
 				base.add(core::mem::offset_of!(FILEDESCRIPTORW, dwFlags))
 					.cast::<u32>()
-					.write_unaligned(0x0000_0004 | 0x0000_0040); // FD_ATTRIBUTES | FD_FILESIZE
+					// FD_ATTRIBUTES | FD_FILESIZE | FD_PROGRESSUI(0x4000)。
+					// 少了 FD_PROGRESSUI，资源管理器按「静默拷贝」处理，
+					// 复制 40 MB 期间连一个进度框都不给，看起来像卡住了。
+					.write_unaligned(0x0000_0004 | 0x0000_0040 | 0x0000_4000);
 				base.add(core::mem::offset_of!(FILEDESCRIPTORW, dwFileAttributes))
 					.cast::<u32>()
 					.write_unaligned(0x0000_0020); // FILE_ATTRIBUTE_ARCHIVE
