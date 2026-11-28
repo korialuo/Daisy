@@ -849,7 +849,13 @@ fn run(
 			cursors.put(seq, cursor);
 		}
 
-		if let Some((seq, frame)) = client.latest_frame()
+		// **先比序号再取帧**：`latest_frame()` 会把整块帧缓冲克隆一份
+		// （1280×800×4 = 4 MB）。原写法把它放在条件链第一位，等于**每一轮
+		// 循环都做一次 4 MB 拷贝**——传文件时虚拟通道 1600 字节一个包，
+		// 吞吐直接被测成 0.7 MB/s（帧明明没变，拷贝却照做）。序号是原子量，
+		// 先读它，没变就一字节都不碰。
+		if client.frame_seq() != last_seq
+			&& let Some((seq, frame)) = client.latest_frame()
 			&& seq != last_seq
 		{
 			last_seq = seq;

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use daisy_core::config::AppPaths;
 use daisy_core::key::EmbeddedKey;
-use daisy_rdp::{ConnectionParams, InputEvent, Key, RdpClient, to_rgba};
+use daisy_rdp::{ConnectionParams, InputEvent, Key, PointerButton, RdpClient, to_rgba};
 use daisy_store::Database;
 
 /// 一次按键组合，例如 `win+r`。
@@ -52,6 +52,18 @@ fn parse_combo(spec: &str) -> Vec<Key> {
 			"down" => Key::ArrowDown,
 			"left" => Key::ArrowLeft,
 			"right" => Key::ArrowRight,
+			"f11" => Key::F11,
+			"f1" => Key::F1,
+			"f2" => Key::F2,
+			"f3" => Key::F3,
+			"f4" => Key::F4,
+			"f5" => Key::F5,
+			"f6" => Key::F6,
+			"f7" => Key::F7,
+			"f8" => Key::F8,
+			"f9" => Key::F9,
+			"f10" => Key::F10,
+			"f12" => Key::F12,
 			other => single_key(other).unwrap_or_else(|| panic!("不认识的键：{other}")),
 		})
 		.collect()
@@ -167,8 +179,15 @@ fn press(client: &RdpClient, key: Key, down: bool) {
 	});
 }
 
-fn tap(client: &RdpClient, key: Key) {
-	press(client, key, true);
+/// 解析 `x,y` 形式的桌面坐标。写错就当 0,0——驱动脚本调试用，不值得 panic。
+fn parse_xy(arg: &str) -> (u16, u16) {
+	let mut parts = arg.split(',');
+	let x = parts.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+	let y = parts.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+	(x, y)
+}
+
+fn tap(client: &RdpClient, key: Key) {	press(client, key, true);
 	client.input_gap(30);
 	press(client, key, false);
 	client.input_gap(40);
@@ -374,6 +393,33 @@ fn main() {
 					}
 					let _ = client.pump(100);
 				}
+			},
+			"move" => {
+				let (x, y) = parse_xy(arg);
+				let _ = client.send_input(InputEvent::PointerMove { x, y });
+				let _ = client.pump(150);
+				println!("    指针移到 {x},{y}");
+			},
+			"click" => {
+				// 远端按「按下那一刻的坐标」决定点在哪，所以必须先移动。
+				let (x, y) = parse_xy(arg);
+				let _ = client.send_input(InputEvent::PointerMove { x, y });
+				let _ = client.pump(150);
+				let _ = client.send_input(InputEvent::PointerButton {
+					button: PointerButton::Left,
+					down: true,
+					x,
+					y,
+				});
+				let _ = client.pump(80);
+				let _ = client.send_input(InputEvent::PointerButton {
+					button: PointerButton::Left,
+					down: false,
+					x,
+					y,
+				});
+				let _ = client.pump(150);
+				println!("    点击 {x},{y}");
 			},
 			"paste" => {
 				press(&client, Key::ControlLeft, true);

@@ -985,8 +985,22 @@ impl Clipboard {
 			);
 		}
 		// 会话线程每个 pump 周期都会来收，不需要额外叫醒。
-		rx.recv_timeout(request_wait(len))
-			.unwrap_or_else(|_| Err("读取远端文件超时（服务端未回应）".to_string()))
+		match rx.recv_timeout(request_wait(len)) {
+			Ok(Ok(mut bytes)) => {
+				// **必须裁剪到请求长度**：服务端回报的 `dataLen` 有时把
+				// `cbRequested` 字段自己也算了进去，比请求多 4 字节
+				// （真机日志：请求 4194304 → 拿到 4194308；请求 2836216 →
+				// 拿到 2836220，稳定 +4）。
+				//
+				// 不裁剪的后果不是「多存几字节」：按返回长度前进的读取方
+				// （macOS 的 `write_file_from_source` 就是 `offset +=
+				// bytes.len()`）会每块错开 4 字节，整份文件内容错位。
+				bytes.truncate(len as usize);
+				Ok(bytes)
+			},
+			Ok(Err(error)) => Err(error),
+			Err(_) => Err("读取远端文件超时（服务端未回应）".to_string()),
+		}
 	}
 
 	/// 清掉所有未决的按需读取并唤醒等待线程——会话断开/换内容时调用，
@@ -4291,7 +4305,9 @@ mod file_clipboard_tests {
 	#[test]
 	fn deferred_manifest_then_chunk_read() {
 		use std::sync::{Mutex as StdMutex, OnceLock};
-		static SENT: OnceLock<StdMutex<Vec<(u32, u32, u64, u32)>>> = OnceLock::new();
+		/// 每次发出的请求：(streamId, index, 起点, 长度)
+		type SentLog = Vec<(u32, u32, u64, u32)>;
+		static SENT: OnceLock<StdMutex<SentLog>> = OnceLock::new();
 		let sent = SENT.get_or_init(|| StdMutex::new(Vec::new()));
 		sent.lock().unwrap().clear();
 

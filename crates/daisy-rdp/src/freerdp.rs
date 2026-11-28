@@ -73,6 +73,16 @@ const fn freerdp_pixel_format(bpp: u32, kind: u32, a: u32, r: u32, g: u32, b: u3
 /// FreeRDP 事件等待的上限。
 const MAXIMUM_WAIT_OBJECTS: usize = 64;
 
+/// `WaitForMultipleObjects` 的超时返回码。
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+
+/// 单次 `pump` 最多连打几轮事件。
+///
+/// 一轮能消化一个「就绪拍」，虚拟通道上就是若干 1600 字节的 SVCC 包。
+/// 取 8 是在吞吐和界面新鲜度之间折中：8 轮大约几个毫秒，之后一定要回
+/// 上层循环去推帧、收指令，否则拖窗口时画面会一顿一顿的。
+const MAX_PUMP_ROUNDS: u32 = 8;
+
 /// 临时清空代理环境变量的 guard。
 ///
 /// FreeRDP 的 `proxy_prepare` 会无条件读 `https_proxy`/`HTTPS_PROXY` 环境变量，
@@ -914,31 +924,55 @@ impl RdpClient {
 			});
 		}
 
-		// SAFETY: handles[..count] 有效。
-		let wait_result =
-			unsafe { ffi::WaitForMultipleObjects(count, handles.as_ptr(), 0, wait_ms) };
+		// **一次叫醒把已就绪的数据榨干**，而不是处理一轮就回上层。
+		//
+		// `freerdp_check_event_handles` 消化一轮事件，虚拟通道的通道数据是
+		// 按 1600 字节一个 SVCC 包进来的；每轮只回一次上层的话，吞吐就被
+		// 「上层每圈的耗时」除掉了。真机实测：剪贴板传文件只有 0.7 MB/s，
+		// 且与请求块大小无关（256 KB / 1 MB / 4 MB 都是这个数）——正是这种
+		// 「按圈限速」的特征。这里在 pump 内部连打，直到没有立刻可读的数据。
+		//
+		// 上限 `MAX_PUMP_ROUNDS` 保证界面不会因为一直有数据而饿死：
+		// 一轮处理完就返回上层推帧/收指令。
+		let mut rounds = 0u32;
+		let mut first = true;
+		loop {
+			let wait_ms = if first { wait_ms } else { 0 };
+			first = false;
+			// SAFETY: handles[..count] 有效。
+			let wait_result =
+				unsafe { ffi::WaitForMultipleObjects(count, handles.as_ptr(), 0, wait_ms) };
 
-		// WAIT_FAILED = 0xFFFFFFFF
-		if wait_result == u32::MAX {
-			return Err(RdpError::Disconnected {
-				reason: "等待事件失败".to_string(),
-			});
-		}
+			// WAIT_FAILED = 0xFFFFFFFF
+			if wait_result == u32::MAX {
+				return Err(RdpError::Disconnected {
+					reason: "等待事件失败".to_string(),
+				});
+			}
+			// WAIT_TIMEOUT = 0x102：这一拍没数据。第一拍超时也要检查一次
+			// （句柄集合可能漏报），之后就没什么可做的了。
+			let timed_out = wait_result == WAIT_TIMEOUT;
 
-		// SAFETY: context 有效。
-		let ok = unsafe { ffi::freerdp_check_event_handles(context) };
-		if ok == 0 {
 			// SAFETY: context 有效。
-			let code = unsafe { ffi::freerdp_get_last_error(context) };
-			let message = unsafe { ffi::freerdp_get_last_error_string(code) };
-			let message = if message.is_null() {
-				"未知错误".to_string()
-			} else {
-				unsafe { std::ffi::CStr::from_ptr(message) }
-					.to_string_lossy()
-					.into_owned()
-			};
-			return Err(RdpError::Disconnected { reason: message });
+			let ok = unsafe { ffi::freerdp_check_event_handles(context) };
+			if ok == 0 {
+				// SAFETY: context 有效。
+				let code = unsafe { ffi::freerdp_get_last_error(context) };
+				let message = unsafe { ffi::freerdp_get_last_error_string(code) };
+				let message = if message.is_null() {
+					"未知错误".to_string()
+				} else {
+					unsafe { std::ffi::CStr::from_ptr(message) }
+						.to_string_lossy()
+						.into_owned()
+				};
+				return Err(RdpError::Disconnected { reason: message });
+			}
+
+			rounds += 1;
+			if timed_out || rounds >= MAX_PUMP_ROUNDS {
+				break;
+			}
 		}
 
 		self.flush_clipboard();
