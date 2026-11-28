@@ -775,8 +775,20 @@ fn run(
 				},
 				Ok(Command::Resize { width, height }) => {
 					if let Err(error) = client.resize_desktop(width, height) {
-						tracing::warn!("[分辨率] {width}×{height} 请求失败：{error}");
-						let _ = statuses.send(RdpStatus::ResizeFailed(error.to_string()));
+						// **「通道还没就绪」不是故障**：动态通道要等服务端在
+						// 握手后才接受，界面一出来就把「跟随窗口」的尺寸排进
+						// 队列，必然早于它就绪。这种情形只记 debug，不回报
+						// `ResizeFailed`——否则用户刚连上就会看到一条
+						// 「图形初始化失败」的红字，过几秒又自己消失。
+						// 界面侧会在收到 `DisplayReady` 后自己重发。
+						if matches!(error, daisy_rdp::RdpError::DisplayNotReady) {
+							tracing::debug!(
+								"[分辨率] {width}×{height} 暂缓：显示通道还没就绪"
+							);
+						} else {
+							tracing::warn!("[分辨率] {width}×{height} 请求失败：{error}");
+							let _ = statuses.send(RdpStatus::ResizeFailed(error.to_string()));
+						}
 					}
 				},
 				Ok(Command::Input(event)) => {

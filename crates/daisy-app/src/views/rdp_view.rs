@@ -205,6 +205,32 @@ impl Resolution {
 		self.last_sent = Some(size);
 	}
 
+	/// 防抖到点、**且通道已就绪**时才取出真正要发的尺寸。
+	///
+	/// 通道没就绪就发，只会换回一条 `DisplayNotReady`：连接初期「跟随窗口」
+	/// 的首次请求**必然**撞上这个窗口期，工具栏于是挂一条
+	/// 「RDP 图形初始化失败」的红字，几秒后通道就绪才自己消失（用户实测：
+	/// 「刚连上的时候经常出现，过一会又没了」）。
+	///
+	/// 这里干脆不发：`pending` 留着、`last_sent` 不动，等 `DisplayReady`
+	/// 之后由同一帧的 `flush_resolution` 补发（那条状态还会清掉
+	/// `last_sent`，保证「同一个尺寸也算重发一次」）。
+	fn take_ready_request(&mut self) -> Option<(u32, u32)> {
+		if !self.ready {
+			return None;
+		}
+		let (size, since) = self.pending?;
+		if since.elapsed() < RESIZE_DEBOUNCE {
+			return None;
+		}
+		self.pending = None;
+		if self.last_sent == Some(size) {
+			return None;
+		}
+		self.last_sent = Some(size);
+		Some(size)
+	}
+
 	/// 按主机记录里的设置初始化工具栏状态。
 	///
 	/// 记录里只存「跟随窗口 / 固定尺寸」，预设名要从尺寸**反查**——
@@ -1658,17 +1684,9 @@ impl RdpView {
 
 	/// 防抖到点就真的发出去。
 	fn flush_resolution(&mut self) {
-		let Some((size, since)) = self.resolution.pending else {
+		let Some(size) = self.resolution.take_ready_request() else {
 			return;
 		};
-		if since.elapsed() < RESIZE_DEBOUNCE {
-			return;
-		}
-		self.resolution.pending = None;
-		if self.resolution.last_sent == Some(size) {
-			return;
-		}
-		self.resolution.last_sent = Some(size);
 		self.resolution.error = None;
 		// 「缩放」= 内容放大倍数，在**本机**兑现：请求给远端的桌面按倍数
 		// 缩小，再由绘制层放大铺满画布。远端（Windows Server）不兑现
@@ -3733,6 +3751,46 @@ mod tests {
 		assert_eq!(state.preset, None);
 		assert_eq!(state.custom, (1500, 800));
 		assert_eq!(state.settings(), custom);
+	}
+
+	/// **回归**：显示通道没就绪前不许发分辨率请求。
+	///
+	/// 真实反馈：刚连上时常看到「RDP 图形初始化失败：disp 通道还没连上，
+	/// 无法调整分辨率」，过一会又自己消失。原因是「跟随窗口」的首次请求
+	/// 必然早于 disp 通道就绪，发出去只会换回一条错误。
+	#[test]
+	fn resize_request_waits_for_display_channel() {
+		let mut resolution = Resolution::new((1280, 800));
+		resolution.follow = true;
+		// 入队一个明显不同的尺寸，并假装防抖已经过去
+		resolution.pending = Some((
+			(1800, 1314),
+			std::time::Instant::now()
+				.checked_sub(std::time::Duration::from_secs(1))
+				.expect("能回退一秒"),
+		));
+
+		// 通道没就绪：一个都不许发，且请求必须留在队列里
+		assert_eq!(
+			resolution.take_ready_request(),
+			None,
+			"通道没就绪就发，只会换回一条「图形初始化失败」的红字"
+		);
+		assert!(resolution.pending.is_some(), "请求要留着，等通道就绪再发");
+
+		// 就绪之后同一帧就能发出去
+		resolution.ready = true;
+		assert_eq!(resolution.take_ready_request(), Some((1800, 1314)));
+		assert_eq!(
+			resolution.last_sent,
+			Some((1800, 1314)),
+			"发出后要记住，避免每帧重发"
+		);
+		assert_eq!(resolution.take_ready_request(), None, "同一个尺寸不重发");
+
+		// 防抖窗口内仍然不发
+		resolution.pending = Some(((1600, 900), std::time::Instant::now()));
+		assert_eq!(resolution.take_ready_request(), None, "防抖没过不能发");
 	}
 
 	/// **回归**：通道就绪后必须能重发「跟随窗口」的首次请求。

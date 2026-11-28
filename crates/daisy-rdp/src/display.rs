@@ -202,16 +202,19 @@ impl DisplayControl {
 	///
 	/// 通道还没连上时返回错误——UI 侧据此提示「远端还没准备好」，
 	/// 而不是静默吞掉（那种"点了没反应"最难查）。
+	/// 通道还没连上时返回 [`RdpError::DisplayNotReady`]——**不当作故障**。
+	/// 动态通道要等服务端在握手后才接受，连接初期请求必然早于它就绪，
+	/// 上层收到这个变体应当静默重试（等 `DisplayReady` 之后重发）。
 	pub fn set_size(&self, width: u32, height: u32) -> Result<()> {
 		let disp = self.disp.load(Ordering::Acquire);
 		if disp.is_null() {
-			return Err(RdpError::Gdi(
-				"disp 通道还没连上，无法调整分辨率".to_string(),
-			));
+			return Err(RdpError::DisplayNotReady);
 		}
 		// SAFETY: disp 是 disp 插件建的上下文，生命周期覆盖会话。
 		let Some(send) = (unsafe { (*disp).SendMonitorLayout }) else {
-			return Err(RdpError::Gdi("disp 通道没有 SendMonitorLayout".to_string()));
+			return Err(RdpError::Resize {
+				reason: "disp 通道没有 SendMonitorLayout".to_string(),
+			});
 		};
 
 		/// 布局里的缩放字段一律 100（见 `set_size` 的说明）。
@@ -232,7 +235,9 @@ impl DisplayControl {
 		// SAFETY: disp 非空；layout 在调用期间有效。
 		let rc = unsafe { send(disp, 1, &mut layout) };
 		if rc != 0 {
-			return Err(RdpError::Gdi(format!("发送分辨率请求失败（返回 {rc}）")));
+			return Err(RdpError::Resize {
+				reason: format!("发送分辨率请求失败（返回 {rc}）"),
+			});
 		}
 		tracing::info!("[分辨率] 已请求远端切到 {width}×{height}");
 		Ok(())
